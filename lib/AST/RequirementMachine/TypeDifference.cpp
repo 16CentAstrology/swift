@@ -23,6 +23,7 @@
 #include "TypeDifference.h"
 #include "swift/AST/Types.h"
 #include "swift/AST/TypeMatcher.h"
+#include "swift/Basic/Assertions.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -159,25 +160,28 @@ namespace {
       bool rhsAbstract = rhsType->isTypeParameter();
 
       if (lhsAbstract && rhsAbstract) {
+        // FIXME: same-element requirements
+        ASSERT(lhsType->isParameterPack() == rhsType->isParameterPack());
+
         unsigned lhsIndex = RewriteContext::getGenericParamIndex(lhsType);
         unsigned rhsIndex = RewriteContext::getGenericParamIndex(rhsType);
 
         auto lhsTerm = LHSSubstitutions[lhsIndex];
         auto rhsTerm = RHSSubstitutions[rhsIndex];
 
-        Optional<int> compare = lhsTerm.compare(rhsTerm, Context);
+        std::optional<int> compare = lhsTerm.compare(rhsTerm, Context);
         if (*compare < 0) {
           SameTypesOnLHS.emplace_back(rhsIndex, lhsTerm);
         } else if (compare > 0) {
           SameTypesOnRHS.emplace_back(lhsIndex, rhsTerm);
         } else {
-          assert(lhsTerm == rhsTerm);
+          ASSERT(lhsTerm == rhsTerm);
         }
         return true;
       }
 
       if (lhsAbstract) {
-        assert(!rhsAbstract);
+        ASSERT(!rhsAbstract);
         unsigned lhsIndex = RewriteContext::getGenericParamIndex(lhsType);
 
         SmallVector<Term, 2> result;
@@ -190,7 +194,7 @@ namespace {
       }
 
       if (rhsAbstract) {
-        assert(!lhsAbstract);
+        ASSERT(!lhsAbstract);
         unsigned rhsIndex = RewriteContext::getGenericParamIndex(rhsType);
 
         SmallVector<Term, 2> result;
@@ -204,7 +208,7 @@ namespace {
 
       // Any other kind of type mismatch involves conflicting concrete types on
       // both sides, which can only happen on invalid input.
-      assert(!lhsAbstract && !rhsAbstract);
+      ASSERT(!lhsAbstract && !rhsAbstract);
       ConcreteConflicts.emplace_back(CanType(lhsType), CanType(rhsType));
       return true;
     }
@@ -301,14 +305,13 @@ swift::rewriting::buildTypeDifference(
   auto nextSubstitution = [&](Term t) -> Type {
     unsigned index = resultSubstitutions.size();
     resultSubstitutions.push_back(t);
-    return GenericTypeParamType::get(/*isParameterPack=*/false,
-                                     /*depth=*/0, index, astCtx);
+    return GenericTypeParamType::getType(/*depth=*/0, index, astCtx);
   };
 
   auto type = symbol.getConcreteType();
   auto substitutions = symbol.getSubstitutions();
 
-  Type resultType = type.transformRec([&](Type t) -> Optional<Type> {
+  Type resultType = type.transformRec([&](Type t) -> std::optional<Type> {
     if (t->is<GenericTypeParamType>()) {
       unsigned index = RewriteContext::getGenericParamIndex(t);
 
@@ -322,36 +325,38 @@ swift::rewriting::buildTypeDifference(
           auto concreteSymbol = pair.second;
           auto concreteType = concreteSymbol.getConcreteType();
 
-          return concreteType.transformRec([&](Type t) -> Optional<Type> {
+          return concreteType.transformRec([&](Type t) -> std::optional<Type> {
             if (t->is<GenericTypeParamType>()) {
               unsigned index = RewriteContext::getGenericParamIndex(t);
               Term substitution = concreteSymbol.getSubstitutions()[index];
               return nextSubstitution(substitution);
             }
 
-            assert(!t->is<DependentMemberType>());
-            return None;
+            // DependentMemberType with ErrorType base is OK.
+            ASSERT(!t->isTypeParameter());
+            return std::nullopt;
           });
         }
       }
 
-      assert(!t->is<DependentMemberType>());
       return nextSubstitution(substitutions[index]);
     }
 
-    return None;
+    // DependentMemberType with ErrorType base is OK.
+    ASSERT(!t->isTypeParameter());
+    return std::nullopt;
   });
 
   auto resultSymbol = [&]() {
     switch (symbol.getKind()) {
     case Symbol::Kind::Superclass:
-      return Symbol::forSuperclass(CanType(resultType),
+      return Symbol::forSuperclass(resultType->getCanonicalType(),
                                    resultSubstitutions, ctx);
     case Symbol::Kind::ConcreteType:
-      return Symbol::forConcreteType(CanType(resultType),
+      return Symbol::forConcreteType(resultType->getCanonicalType(),
                                      resultSubstitutions, ctx);
     case Symbol::Kind::ConcreteConformance:
-      return Symbol::forConcreteConformance(CanType(resultType),
+      return Symbol::forConcreteConformance(resultType->getCanonicalType(),
                                             resultSubstitutions,
                                             symbol.getProtocol(),
                                             ctx);
@@ -367,7 +372,7 @@ swift::rewriting::buildTypeDifference(
 
 unsigned
 RewriteSystem::recordTypeDifference(const TypeDifference &difference) {
-  assert(difference.LHS != difference.RHS);
+  ASSERT(difference.LHS != difference.RHS);
 
   auto key = std::make_tuple(difference.BaseTerm,
                              difference.LHS,
@@ -380,8 +385,7 @@ RewriteSystem::recordTypeDifference(const TypeDifference &difference) {
   Differences.push_back(difference);
 
   auto inserted = DifferenceMap.insert(std::make_pair(key, index));
-  assert(inserted.second);
-  (void) inserted;
+  ASSERT(inserted.second);
 
   return index;
 }
@@ -415,14 +419,14 @@ const TypeDifference &RewriteSystem::getTypeDifference(unsigned index) const {
 ///
 /// See the comment at the top of TypeDifference in TypeDifference.h for a
 /// description of the actual transformations.
-bool
-RewriteSystem::computeTypeDifference(Term baseTerm, Symbol lhs, Symbol rhs,
-                                     Optional<unsigned> &lhsDifferenceID,
-                                     Optional<unsigned> &rhsDifferenceID) {
-  assert(lhs.getKind() == rhs.getKind());
+bool RewriteSystem::computeTypeDifference(
+    Term baseTerm, Symbol lhs, Symbol rhs,
+    std::optional<unsigned> &lhsDifferenceID,
+    std::optional<unsigned> &rhsDifferenceID) {
+  ASSERT(lhs.getKind() == rhs.getKind());
 
-  lhsDifferenceID = None;
-  rhsDifferenceID = None;
+  lhsDifferenceID = std::nullopt;
+  rhsDifferenceID = std::nullopt;
 
   // Fast path if there's nothing to do.
   if (lhs == rhs)
@@ -435,8 +439,7 @@ RewriteSystem::computeTypeDifference(Term baseTerm, Symbol lhs, Symbol rhs,
 
   bool success = matcher.match(lhs.getConcreteType(),
                                rhs.getConcreteType());
-  assert(success);
-  (void) success;
+  ASSERT(success);
 
   matcher.verify();
 

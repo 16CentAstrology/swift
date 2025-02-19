@@ -148,10 +148,12 @@ let _: ImplicitMembers = .implicit.getAnotherOptional() // expected-error {{valu
 let _: ImplicitMembers = .implicit[optional: ()] // expected-error {{value of optional type 'ImplicitMembers?' must be unwrapped to a value of type 'ImplicitMembers'}} expected-note {{coalesce using '??' to provide a default when the optional value contains 'nil'}} {{49-49= ?? <#default value#>}} expected-note {{force-unwrap using '!' to abort execution if the optional value contains 'nil'}} {{49-49=!}}
 let _: ImplicitMembers = .implicit[funcOptional: ()]() // expected-error {{value of optional type 'ImplicitMembers?' must be unwrapped to a value of type 'ImplicitMembers'}} expected-note {{coalesce using '??' to provide a default when the optional value contains 'nil'}} {{55-55= ?? <#default value#>}} expected-note {{force-unwrap using '!' to abort execution if the optional value contains 'nil'}} {{55-55=!}}
 
-// FIXME: Improve these diagnostics (should probably offer unwrapping, as above)
-let _: ImplicitMembers = .implicit.anotherOptional?.another // expected-error{{cannot convert value of type 'Optional<_>' to specified type 'ImplicitMembers'}}
-let _: ImplicitMembers = .implicit[optionalFunc: ()]?() // expected-error{{cannot convert value of type 'Optional<_>' to specified type 'ImplicitMembers'}}
-
+let _: ImplicitMembers = .implicit.anotherOptional?.another // expected-error {{value of optional type 'ImplicitMembers?' must be unwrapped to a value of type 'ImplicitMembers'}}
+// expected-note@-1 {{coalesce using '??' to provide a default when the optional value contains 'nil'}} {{60-60= ?? <#default value#>}}
+// expected-note@-2 {{force-unwrap using '!' to abort execution if the optional value contains 'nil'}} {{26-26=(}} {{60-60=)!}}
+let _: ImplicitMembers = .implicit[optionalFunc: ()]?() // expected-error{{value of optional type 'ImplicitMembers?' must be unwrapped to a value of type 'ImplicitMembers'}}
+// expected-note@-1 {{coalesce using '??' to provide a default when the optional value contains 'nil'}} {{56-56= ?? <#default value#>}}
+// expected-note@-2 {{force-unwrap using '!' to abort execution if the optional value contains 'nil'}} {{26-26=(}} {{56-56=)!}}
 
 let _: ImplicitMembers = .other.implicit
 let _: ImplicitMembers = .implicit.anotherOther.implicit
@@ -221,6 +223,7 @@ let _: ImplicitMembers = .implicit[funcOptional: ()]()!.another
 let _: ImplicitMembers? = .implicit[funcOptional: ()]()?.another
 let _: ImplicitMembers = .implicit[optionalFunc: ()]!().another
 let _: ImplicitMembers? = .implicit[optionalFunc: ()]?().another
+let _: ImplicitMembers = .implicit.self
 
 func implicit(_ i: inout ImplicitMembers) {
     if i == .implicit {}
@@ -370,4 +373,12 @@ func rdar68094328() {
     foo(C.bar, .init(string: str).value) // Ok
     foo(C.bar, .init(string: str).baz(str: "")) // Ok
   }
+}
+
+// Ensure postfix operator is not a part of implicit member chain.
+postfix operator ^
+postfix func ^ (_ lhs: ImplicitMembers) -> Int { 0 }
+func acceptInt(_ x: Int) {}
+func postfixOpIsNotAMemberChain() {
+  acceptInt(.implicit.another^)
 }

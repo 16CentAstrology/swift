@@ -19,7 +19,9 @@
 
 #include "swift/SILOptimizer/Utils/KeyPathProjector.h"
 
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/SILInstruction.h"
+#include "swift/SIL/InstructionUtils.h"
 
 using namespace swift;
 
@@ -119,8 +121,13 @@ public:
     } else {
       // Accessing a class member -> reading the class
       parent->project(AccessType::Get, [&](SILValue parentValue) {
-        SingleValueInstruction *Ref = builder.createLoad(loc, parentValue,
-                                                         LoadOwnershipQualifier::Unqualified);
+        SingleValueInstruction *Borrow = nullptr;
+        SingleValueInstruction *Ref;
+        if (builder.hasOwnership()) {
+          Ref = Borrow = builder.createLoadBorrow(loc, parentValue);
+        } else {
+          Ref = builder.createLoad(loc, parentValue, LoadOwnershipQualifier::Unqualified);
+        }
         
         // If we were previously accessing a class member, we're done now.
         insertEndAccess(beginAccess, builder);
@@ -129,13 +136,7 @@ public:
         while (Ref->getType().getClassOrBoundGenericClass() !=
                storedProperty->getDeclContext()) {
           SILType superCl = Ref->getType().getSuperclass();
-          if (!superCl) {
-            // This should never happen, because the property should be in the
-            // decl or in a superclass of it. Just handle this to be on the safe
-            // side.
-            callback(SILValue());
-            return;
-          }
+          ASSERT(superCl && "the property should be in the decl or in a superclass of it");
           Ref = builder.createUpcast(loc, Ref, superCl);
         }
         
@@ -161,6 +162,10 @@ public:
         // end the access now
         if (beginAccess == addr) {
           insertEndAccess(beginAccess, builder);
+        }
+        
+        if (Borrow) {
+          builder.createEndBorrow(loc, Borrow);
         }
       });
     }
@@ -223,8 +228,8 @@ public:
       // The callback expects a memory address it can read from,
       // so allocate a buffer.
       auto &function = builder.getFunction();
-      auto substType = component.getComponentType().subst(keyPath->getSubstitutions(),
-                                                           None);
+      auto substType = component.getComponentType().subst(
+          keyPath->getSubstitutions(), std::nullopt);
       SILType type = function.getLoweredType(
                          Lowering::AbstractionPattern::getOpaque(), substType);
       auto addr = builder.createAllocStack(loc, type);
@@ -301,8 +306,8 @@ public:
           // The callback expects a memory address it can write to,
           // so allocate a writeback buffer.
           auto &function = builder.getFunction();
-          auto substType = component.getComponentType().subst(keyPath->getSubstitutions(),
-                                                               None);
+          auto substType = component.getComponentType().subst(
+              keyPath->getSubstitutions(), std::nullopt);
           SILType type = function.getLoweredType(
                         Lowering::AbstractionPattern::getOpaque(), substType);
           auto addr = builder.createAllocStack(loc, type);
@@ -351,8 +356,8 @@ public:
     
     parent->project(AccessType::Get, [&](SILValue parentValue) {
       auto &function = builder.getFunction();
-      auto substType = component.getComponentType().subst(keyPath->getSubstitutions(),
-                                                           None);
+      auto substType = component.getComponentType().subst(
+          keyPath->getSubstitutions(), std::nullopt);
       SILType optType = function.getLoweredType(
                          Lowering::AbstractionPattern::getOpaque(), substType);
       SILType objType = optType.getOptionalObjectType().getAddressType();
@@ -568,7 +573,8 @@ public:
       // If we're reading an optional chain, create an optional result.
       auto resultCanType = components.back().getComponentType();
       auto &function = builder.getFunction();
-      auto substType = resultCanType.subst(keyPath->getSubstitutions(), None);
+      auto substType =
+          resultCanType.subst(keyPath->getSubstitutions(), std::nullopt);
       auto optType = function.getLoweredType(
                          Lowering::AbstractionPattern::getOpaque(), substType);
       
@@ -668,9 +674,10 @@ private:
 
 KeyPathInst *
 KeyPathProjector::getLiteralKeyPath(SILValue keyPath) {
-  if (auto *upCast = dyn_cast<UpcastInst>(keyPath))
-    keyPath = upCast->getOperand();
-  // TODO: Look through other conversions, copies, etc.?
+  while (auto *upCast = dyn_cast<UpcastInst>(keyPath)) {
+    keyPath = lookThroughOwnershipInsts(upCast->getOperand());
+  }
+
   return dyn_cast<KeyPathInst>(keyPath);
 }
 
@@ -685,15 +692,28 @@ KeyPathProjector::create(SILValue keyPath, SILValue root,
   // Check if the keypath only contains patterns which we support.
   auto components = kpInst->getPattern()->getComponents();
   for (const KeyPathPatternComponent &comp : components) {
-    if (comp.getKind() == KeyPathPatternComponent::Kind::GettableProperty ||
-        comp.getKind() == KeyPathPatternComponent::Kind::SettableProperty) {
-      if (!comp.getExternalSubstitutions().empty() ||
-          !comp.getSubscriptIndices().empty()) {
-        // TODO: right now we can't optimize computed properties that require
-        // additional context for subscript indices or generic environment
-        // See https://github.com/apple/swift/pull/28799#issuecomment-570299845
-        return nullptr;
+    switch (comp.getKind()) {
+      case KeyPathPatternComponent::Kind::GettableProperty:
+      case KeyPathPatternComponent::Kind::SettableProperty:
+        if (!comp.getExternalSubstitutions().empty() ||
+            !comp.getSubscriptIndices().empty()) {
+          // TODO: right now we can't optimize computed properties that require
+          // additional context for subscript indices or generic environment
+          // See https://github.com/apple/swift/pull/28799#issuecomment-570299845
+          return nullptr;
+        }
+        break;
+      case KeyPathPatternComponent::Kind::StoredProperty: {
+        auto *declCtxt = comp.getStoredPropertyDecl()->getDeclContext();
+        if (!isa<StructDecl>(declCtxt) && !isa<ClassDecl>(declCtxt)) {
+          // This can happen, e.g. for ObjectiveC class properties, which are
+          // defined in an extension.
+          return nullptr;
+        }
+        break;
       }
+      default:
+        break;
     }
   }
 

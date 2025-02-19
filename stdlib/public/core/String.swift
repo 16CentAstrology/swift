@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2020 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2024 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -11,14 +11,6 @@
 //===----------------------------------------------------------------------===//
 
 import SwiftShims
-
-@inlinable @_transparent
-internal func unimplemented_utf8_32bit(
-  _ message: String = "",
-  file: StaticString = #file, line: UInt = #line
-) -> Never {
-  fatalError("32-bit: Unimplemented for UTF-8 support", file: file, line: line)
-}
 
 /// A Unicode string value that is a collection of characters.
 ///
@@ -349,6 +341,7 @@ internal func unimplemented_utf8_32bit(
 /// [scalars]: http://www.unicode.org/glossary/#unicode_scalar_value
 /// [equivalence]: http://www.unicode.org/glossary/#canonical_equivalent
 @frozen
+@_eagerMove
 public struct String {
   public // @SPI(Foundation)
   var _guts: _StringGuts
@@ -402,18 +395,39 @@ extension String {
 }
 
 extension String {
+  /// Returns a boolean value indicating whether this string is identical to
+  /// `other`.
+  ///
+  /// Two string values are identical if there is no way to distinguish between
+  /// them.
+  ///
+  /// Comparing strings this way includes comparing (normally) hidden
+  /// implementation details such as the memory location of any underlying
+  /// string storage object. Therefore, identical strings are guaranteed to
+  /// compare equal with `==`, but not all equal strings are considered
+  /// identical.
+  ///
+  /// - Performance: O(1)
+  @_alwaysEmitIntoClient
+  public func _isIdentical(to other: Self) -> Bool {
+    self._guts.rawBits == other._guts.rawBits
+  }
+}
+
+extension String {
   // This force type-casts element to UInt8, since we cannot currently
   // communicate to the type checker that we proved this with our dynamic
   // check in String(decoding:as:).
   @_alwaysEmitIntoClient
   @inline(never) // slow-path
-  private static func _fromNonContiguousUnsafeBitcastUTF8Repairing<
+  internal static func _fromNonContiguousUnsafeBitcastUTF8Repairing<
     C: Collection
   >(_ input: C) -> (result: String, repairsMade: Bool) {
     _internalInvariant(C.Element.self == UInt8.self)
     return Array(input).withUnsafeBufferPointer {
-      let raw = UnsafeRawBufferPointer($0)
-      return String._fromUTF8Repairing(raw.bindMemory(to: UInt8.self))
+      UnsafeRawBufferPointer($0).withMemoryRebound(to: UInt8.self) {
+        String._fromUTF8Repairing($0)
+      }
     }
   }
 
@@ -455,6 +469,7 @@ extension String {
       return
     }
 
+    #if !$Embedded
     // Fast path for untyped raw storage and known stdlib types
     if let contigBytes = codeUnits as? _HasContiguousBytes,
       contigBytes._providesContiguousBytesNoCopy
@@ -468,8 +483,119 @@ extension String {
       }
       return
     }
+    #endif
 
     self = String._fromNonContiguousUnsafeBitcastUTF8Repairing(codeUnits).0
+  }
+
+  /// Creates a new string by copying and validating the sequence of
+  /// code units passed in, according to the specified encoding.
+  ///
+  /// This initializer does not try to repair ill-formed code unit sequences.
+  /// If any are found, the result of the initializer is `nil`.
+  ///
+  /// The following example calls this initializer with the contents of two
+  /// different arrays---first with a well-formed UTF-8 code unit sequence and
+  /// then with an ill-formed UTF-16 code unit sequence.
+  ///
+  ///     let validUTF8: [UInt8] = [67, 97, 0, 102, 195, 169]
+  ///     let valid = String(validating: validUTF8, as: UTF8.self)
+  ///     print(valid ?? "nil")
+  ///     // Prints "Café"
+  ///
+  ///     let invalidUTF16: [UInt16] = [0x41, 0x42, 0xd801]
+  ///     let invalid = String(validating: invalidUTF16, as: UTF16.self)
+  ///     print(invalid ?? "nil")
+  ///     // Prints "nil"
+  ///
+  /// - Parameters:
+  ///   - codeUnits: A sequence of code units that encode a `String`
+  ///   - encoding: A conformer to `Unicode.Encoding` to be used
+  ///               to decode `codeUnits`.
+  @inlinable
+  @available(SwiftStdlib 6.0, *)
+  public init?<Encoding: Unicode.Encoding>(
+    validating codeUnits: some Sequence<Encoding.CodeUnit>,
+    as encoding: Encoding.Type
+  ) {
+    let contiguousResult = codeUnits.withContiguousStorageIfAvailable {
+      String._validate($0, as: Encoding.self)
+    }
+    if let validationResult = contiguousResult {
+      guard let validatedString = validationResult else {
+        return nil
+      }
+      self = validatedString
+      return
+    }
+
+    // slow-path
+    var transcoded: [UTF8.CodeUnit] = []
+    transcoded.reserveCapacity(codeUnits.underestimatedCount)
+    var isASCII = true
+    let error = transcode(
+      codeUnits.makeIterator(),
+      from: Encoding.self,
+      to: UTF8.self,
+      stoppingOnError: true,
+      into: {
+        uint8 in
+        transcoded.append(uint8)
+        if isASCII && (uint8 & 0x80) == 0x80 { isASCII = false }
+      }
+    )
+    if error { return nil }
+    self = transcoded.withUnsafeBufferPointer{
+      String._uncheckedFromUTF8($0, asciiPreScanResult: isASCII)
+    }
+  }
+
+  /// Creates a new string by copying and validating the sequence of
+  /// code units passed in, according to the specified encoding.
+  ///
+  /// This initializer does not try to repair ill-formed code unit sequences.
+  /// If any are found, the result of the initializer is `nil`.
+  ///
+  /// The following example calls this initializer with the contents of two
+  /// different arrays---first with a well-formed UTF-8 code unit sequence and
+  /// then with an ill-formed ASCII code unit sequence.
+  ///
+  ///     let validUTF8: [Int8] = [67, 97, 0, 102, -61, -87]
+  ///     let valid = String(validating: validUTF8, as: UTF8.self)
+  ///     print(valid ?? "nil")
+  ///     // Prints "Café"
+  ///
+  ///     let invalidASCII: [Int8] = [67, 97, -5]
+  ///     let invalid = String(validating: invalidASCII, as: Unicode.ASCII.self)
+  ///     print(invalid ?? "nil")
+  ///     // Prints "nil"
+  ///
+  /// - Parameters:
+  ///   - codeUnits: A sequence of code units that encode a `String`
+  ///   - encoding: A conformer to `Unicode.Encoding` that can decode
+  ///               `codeUnits` as `UInt8`
+  @inlinable
+  @available(SwiftStdlib 6.0, *)
+  public init?<Encoding>(
+    validating codeUnits: some Sequence<Int8>,
+    as encoding: Encoding.Type
+  ) where Encoding: Unicode.Encoding, Encoding.CodeUnit == UInt8 {
+    let contiguousResult = codeUnits.withContiguousStorageIfAvailable {
+      $0.withMemoryRebound(to: UInt8.self) {
+        String._validate($0, as: Encoding.self)
+      }
+    }
+    if let validationResult = contiguousResult {
+      guard let validatedString = validationResult else {
+        return nil
+      }
+      self = validatedString
+      return
+    }
+
+    // slow-path
+    let uint8s = codeUnits.lazy.map(UInt8.init(bitPattern:))
+    self.init(validating: uint8s, as: Encoding.self)
   }
 
   /// Creates a new string with the specified capacity in UTF-8 code units, and
@@ -537,7 +663,9 @@ extension String {
     ) throws -> Int
   ) rethrows {
     if _fastPath(capacity <= _SmallString.capacity) {
-      let smol = try _SmallString(initializingUTF8With: initializer)
+      let smol = try _SmallString(initializingUTF8With: {
+        try initializer(.init(start: $0.baseAddress, count: capacity))
+      })
       // Fast case where we fit in a _SmallString and don't need UTF8 validation
       if _fastPath(smol.isASCII) {
         self = String(_StringGuts(smol))
@@ -551,6 +679,26 @@ extension String {
     self = try String._fromLargeUTF8Repairing(
       uninitializedCapacity: capacity,
       initializingWith: initializer)
+  }
+
+  /// Calls the given closure with a pointer to the contents of the string,
+  /// represented as a null-terminated sequence of UTF-8 code units.
+  ///
+  /// The pointer passed as an argument to `body` is valid only during the
+  /// execution of `withCString(_:)`. Do not store or return the pointer for
+  /// later use.
+  ///
+  /// - Parameter body: A closure with a pointer parameter that points to a
+  ///   null-terminated sequence of UTF-8 code units. If `body` has a return
+  ///   value, that value is also used as the return value for the
+  ///   `withCString(_:)` method. The pointer argument is valid only for the
+  ///   duration of the method's execution.
+  /// - Returns: The return value, if any, of the `body` closure parameter.
+  @inlinable // fast-path: already C-string compatible
+  public func withCString<Result>(
+    _ body: (UnsafePointer<Int8>) throws -> Result
+  ) rethrows -> Result {
+    return try _guts.withCString(body)
   }
 
   /// Calls the given closure with a pointer to the contents of the string,
@@ -676,11 +824,49 @@ extension String: ExpressibleByStringLiteral {
 extension String: CustomDebugStringConvertible {
   /// A representation of the string that is suitable for debugging.
   public var debugDescription: String {
-    var result = "\""
-    for us in self.unicodeScalars {
-      result += us.escaped(asASCII: false)
+    func hasBreak(between left: String, and right: Unicode.Scalar) -> Bool {
+      // Note: we know `left` ends with an ASCII character, so we only need to
+      // look at its last scalar.
+      var state = _GraphemeBreakingState()
+      return state.shouldBreak(between: left.unicodeScalars.last!, and: right)
     }
-    result += "\""
+
+    // Prevent unquoted scalars in the string from combining with the opening
+    // `"` or the tail of the preceding quoted scalar.
+    var result = "\""
+    var wantBreak = true // true if next scalar must not combine with the last
+    for us in self.unicodeScalars {
+      if let escaped = us._escaped(asASCII: false) {
+        result += escaped
+        wantBreak = true
+      } else if wantBreak && !hasBreak(between: result, and: us) {
+        result += us.escaped(asASCII: true)
+        wantBreak = true
+      } else {
+        result.unicodeScalars.append(us)
+        wantBreak = false
+      }
+    }
+    // Also prevent the last scalar from combining with the closing `"`.
+    var suffix = "\"".unicodeScalars
+    while !result.isEmpty {
+      // Append first scalar of suffix, then check if it combines.
+      result.unicodeScalars.append(suffix.first!)
+      let i = result.index(before: result.endIndex)
+      let j = result.unicodeScalars.index(before: result.endIndex)
+      if i >= j {
+        // All good; append the rest and we're done.
+        result.unicodeScalars.append(contentsOf: suffix.dropFirst())
+        break
+      }
+      // Cancel appending the scalar, then quote the last scalar in `result` and
+      // prepend it to `suffix`.
+      result.unicodeScalars.removeLast()
+      let last = result.unicodeScalars.removeLast()
+      suffix.insert(
+        contentsOf: last.escaped(asASCII: true).unicodeScalars,
+        at: suffix.startIndex)
+    }
     return result
   }
 }
@@ -988,7 +1174,7 @@ extension _StringGutsSlice {
       }
     }
 
-    for scalar in substring._internalNFC {
+    for scalar in substring.unicodeScalars._internalNFC {
       try scalar.withUTF8CodeUnits {
         for byte in $0 {
           try f(byte)
@@ -998,7 +1184,7 @@ extension _StringGutsSlice {
   }
 
   internal func _fastNFCCheck(_ isNFCQC: inout Bool, _ prevCCC: inout UInt8) {
-    _guts.withFastUTF8 { utf8 in
+    withFastUTF8 { utf8 in
       var position = 0
 
       while position < utf8.count {

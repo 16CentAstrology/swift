@@ -297,6 +297,7 @@
 ///   instances of those types always have a contiguous block of memory as
 ///   their storage.
 @frozen
+@_eagerMove
 public struct Array<Element>: _DestructorSafeContainer {
   #if _runtime(_ObjC)
   @usableFromInline
@@ -328,7 +329,7 @@ extension Array {
   @_effects(notEscaping self.**)
   public // @testable
   func _hoistableIsNativeTypeChecked() -> Bool {
-   return _buffer.arrayPropertyIsNativeTypeChecked
+    return _buffer.arrayPropertyIsNativeTypeChecked
   }
 
   @inlinable
@@ -474,6 +475,10 @@ extension Array: _ArrayProtocol {
   public var capacity: Int {
     return _getCapacity()
   }
+
+  #if $Embedded
+  public typealias AnyObject = Builtin.NativeObject
+  #endif
 
   /// An object that guarantees the lifetime of this array's elements.
   @inlinable
@@ -801,6 +806,7 @@ extension Array: RandomAccessCollection, MutableCollection {
   
   /// The number of elements in the array.
   @inlinable
+  @_semantics("array.get_count")
   public var count: Int {
     return _getCount()
   }
@@ -1377,8 +1383,15 @@ extension Array: RangeReplaceableCollection {
     if !keepCapacity {
       _buffer = _Buffer()
     }
-    else {
+    else if _buffer.isMutableAndUniquelyReferenced() {
       self.replaceSubrange(indices, with: EmptyCollection())
+    }
+    else {
+      let buffer = _ContiguousArrayBuffer<Element>(
+        _uninitializedCount: 0,
+        minimumCapacity: capacity
+      )
+      _buffer = _Buffer(_buffer: buffer, shiftedToStartIndex: startIndex)
     }
   }
 
@@ -1455,6 +1468,7 @@ extension Array: CustomReflectable {
 }
 #endif
 
+@_unavailableInEmbedded
 extension Array: CustomStringConvertible, CustomDebugStringConvertible {
   /// A textual representation of the array and its elements.
   public var description: String {
@@ -1551,6 +1565,16 @@ extension Array {
       initializingWith: initializer)
   }
 
+  // Superseded by the typed-throws version of this function, but retained
+  // for ABI reasons.
+  @usableFromInline
+  @_disfavoredOverload
+  func withUnsafeBufferPointer<R>(
+    _ body: (UnsafeBufferPointer<Element>) throws -> R
+  ) rethrows -> R {
+    return try _buffer.withUnsafeBufferPointer(body)
+  }
+
   /// Calls a closure with a pointer to the array's contiguous storage.
   ///
   /// Often, the optimizer can eliminate bounds checks within an array
@@ -1580,11 +1604,42 @@ extension Array {
   ///   for the `withUnsafeBufferPointer(_:)` method. The pointer argument is
   ///   valid only for the duration of the method's execution.
   /// - Returns: The return value, if any, of the `body` closure parameter.
-  @inlinable
-  public func withUnsafeBufferPointer<R>(
-    _ body: (UnsafeBufferPointer<Element>) throws -> R
-  ) rethrows -> R {
+  @_alwaysEmitIntoClient
+  public func withUnsafeBufferPointer<R, E>(
+    _ body: (UnsafeBufferPointer<Element>) throws(E) -> R
+  ) throws(E) -> R {
     return try _buffer.withUnsafeBufferPointer(body)
+  }
+
+  // Superseded by the typed-throws version of this function, but retained
+  // for ABI reasons.
+  @_semantics("array.withUnsafeMutableBufferPointer")
+  @_effects(notEscaping self.value**)
+  @usableFromInline
+  @inline(__always)
+  @_silgen_name("$sSa30withUnsafeMutableBufferPointeryqd__qd__SryxGzKXEKlF")
+  mutating func __abi_withUnsafeMutableBufferPointer<R>(
+    _ body: (inout UnsafeMutableBufferPointer<Element>) throws -> R
+  ) rethrows -> R {
+    _makeMutableAndUnique()
+    let count = _buffer.mutableCount
+
+    // Create an UnsafeBufferPointer that we can pass to body
+    let pointer = _buffer.mutableFirstElementAddress
+    var inoutBufferPointer = UnsafeMutableBufferPointer(
+      start: pointer, count: count)
+
+    defer {
+      _precondition(
+        inoutBufferPointer.baseAddress == pointer &&
+        inoutBufferPointer.count == count,
+        "Array withUnsafeMutableBufferPointer: replacing the buffer is not allowed")
+      _endMutation()
+      _fixLifetime(self)
+    }
+
+    // Invoke the body.
+    return try body(&inoutBufferPointer)
   }
 
   /// Calls the given closure with a pointer to the array's mutable contiguous
@@ -1625,14 +1680,14 @@ extension Array {
   /// - Returns: The return value, if any, of the `body` closure parameter.
   @_semantics("array.withUnsafeMutableBufferPointer")
   @_effects(notEscaping self.value**)
-  @inlinable // FIXME(inline-always)
+  @_alwaysEmitIntoClient
   @inline(__always) // Performance: This method should get inlined into the
   // caller such that we can combine the partial apply with the apply in this
   // function saving on allocating a closure context. This becomes unnecessary
   // once we allocate noescape closures on the stack.
-  public mutating func withUnsafeMutableBufferPointer<R>(
-    _ body: (inout UnsafeMutableBufferPointer<Element>) throws -> R
-  ) rethrows -> R {
+  public mutating func withUnsafeMutableBufferPointer<R, E>(
+    _ body: (inout UnsafeMutableBufferPointer<Element>) throws(E) -> R
+  ) throws(E) -> R {
     _makeMutableAndUnique()
     let count = _buffer.mutableCount
 
@@ -1949,6 +2004,7 @@ extension Array {
 }
 #endif
 
+@_unavailableInEmbedded
 extension Array: _HasCustomAnyHashableRepresentation
   where Element: Hashable {
   public __consuming func _toCustomAnyHashable() -> AnyHashable? {
@@ -1956,11 +2012,13 @@ extension Array: _HasCustomAnyHashableRepresentation
   }
 }
 
+@_unavailableInEmbedded
 internal protocol _ArrayAnyHashableProtocol: _AnyHashableBox {
   var count: Int { get }
   subscript(index: Int) -> AnyHashable { get }
 }
 
+@_unavailableInEmbedded
 internal struct _ArrayAnyHashableBox<Element: Hashable>
   : _ArrayAnyHashableProtocol {
   internal let _value: [Element]

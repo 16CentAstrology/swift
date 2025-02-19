@@ -16,14 +16,14 @@
 #ifndef SWIFT_AST_PROTOCOLCONFORMANCEREF_H
 #define SWIFT_AST_PROTOCOLCONFORMANCEREF_H
 
+#include "swift/AST/ProtocolConformanceRef.h"
+#include "swift/AST/Type.h"
+#include "swift/AST/TypeAlignments.h"
 #include "swift/Basic/Debug.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/PointerUnion.h"
 #include "llvm/ADT/STLExtras.h"
-#include "swift/AST/ProtocolConformanceRef.h"
-#include "swift/AST/Requirement.h"
-#include "swift/AST/TypeAlignments.h"
-#include "swift/AST/Type.h"
+#include <optional>
 
 namespace llvm {
   class raw_ostream;
@@ -35,6 +35,7 @@ class BuiltinProtocolConformance;
 class ConcreteDeclRef;
 class PackConformance;
 class ProtocolConformance;
+class Requirement;
 enum class EffectKind : uint8_t;
 
 /// A ProtocolConformanceRef is a handle to a protocol conformance which
@@ -58,12 +59,14 @@ class ProtocolConformanceRef {
 
   explicit ProtocolConformanceRef(UnionType value) : Union(value) {}
 
-public:
   /// Create an abstract protocol conformance reference.
   explicit ProtocolConformanceRef(ProtocolDecl *proto) : Union(proto) {
     assert(proto != nullptr &&
            "cannot construct ProtocolConformanceRef with null");
   }
+
+public:
+  ProtocolConformanceRef() : Union() {}
 
   /// Create a concrete protocol conformance reference.
   explicit ProtocolConformanceRef(ProtocolConformance *conf) : Union(conf) {
@@ -77,9 +80,6 @@ public:
            "cannot construct ProtocolConformanceRef with null");
   }
 
-  ProtocolConformanceRef(std::nullptr_t = nullptr)
-      : Union((ProtocolDecl *)nullptr) {}
-
   static ProtocolConformanceRef forInvalid() {
     return ProtocolConformanceRef();
   }
@@ -89,16 +89,13 @@ public:
   static ProtocolConformanceRef forMissingOrInvalid(
       Type type, ProtocolDecl *proto);
 
-  bool isInvalid() const {
-    return !Union;
-  }
+  bool isInvalid() const;
 
   explicit operator bool() const { return !isInvalid(); }
 
-  /// Create either a concrete or an abstract protocol conformance reference,
-  /// depending on whether ProtocolConformance is null.
-  explicit ProtocolConformanceRef(ProtocolDecl *protocol,
-                                  ProtocolConformance *conf);
+  /// Create an abstract conformance for a type parameter or archetype.
+  static ProtocolConformanceRef forAbstract(Type subjectType,
+                                            ProtocolDecl *protocol);
 
   bool isConcrete() const {
     return !isInvalid() && Union.is<ProtocolConformance*>();
@@ -129,7 +126,7 @@ public:
   /// Determine whether this conformance (or a conformance it depends on)
   /// involves a "missing" conformance anywhere. Such conformances
   /// cannot be depended on to always exist.
-  bool hasMissingConformance(ModuleDecl *module) const;
+  bool hasMissingConformance() const;
 
   /// Enumerate the missing conformances in this conformance.
   ///
@@ -141,7 +138,6 @@ public:
   /// \returns \c true if any invocation of \c fn returned true,
   /// \c false otherwise.
   bool forEachMissingConformance(
-      ModuleDecl *module,
       llvm::function_ref<bool(BuiltinProtocolConformance *missing)> fn) const;
 
   using OpaqueValue = void*;
@@ -154,18 +150,28 @@ public:
   ProtocolDecl *getRequirement() const;
   
   /// Apply a substitution to the conforming type.
-  ProtocolConformanceRef subst(Type origType,
-                               SubstitutionMap subMap,
-                               SubstOptions options=None) const;
+  ProtocolConformanceRef subst(Type origType, SubstitutionMap subMap,
+                               SubstOptions options = std::nullopt) const;
 
   /// Apply a substitution to the conforming type.
-  ProtocolConformanceRef subst(Type origType,
-                               TypeSubstitutionFn subs,
+  ProtocolConformanceRef subst(Type origType, TypeSubstitutionFn subs,
                                LookupConformanceFn conformances,
-                               SubstOptions options=None) const;
+                               SubstOptions options = std::nullopt) const;
+
+  /// Apply a substitution to the conforming type.
+  ///
+  /// This function should generally not be used outside of the substitution
+  /// subsystem.
+  ProtocolConformanceRef subst(Type origType,
+                               InFlightSubstitution &IFS) const;
 
   /// Map contextual types to interface types in the conformance.
   ProtocolConformanceRef mapConformanceOutOfContext() const;
+
+  /// Look up the type witness for an associated type declaration in this
+  /// conformance.
+  Type getTypeWitness(Type origType, AssociatedTypeDecl *assocType,
+                      SubstOptions options = std::nullopt) const;
 
   /// Given a dependent type (expressed in terms of this conformance's
   /// protocol), follow it from the conforming type.
@@ -209,10 +215,6 @@ public:
 
   /// Create a canonical conformance from the current one.
   ProtocolConformanceRef getCanonicalConformanceRef() const;
-
-  /// Get any additional requirements that are required for this conformance to
-  /// be satisfied, if they're possible to compute.
-  Optional<ArrayRef<Requirement>> getConditionalRequirementsIfAvailable() const;
 
   /// Get any additional requirements that are required for this conformance to
   /// be satisfied.

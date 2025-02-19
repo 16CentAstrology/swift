@@ -11,7 +11,7 @@
 
 // Run the scan
 // RUN: %target-swift-frontend -scan-dependencies %s -o %t/deps.json -F %t/Frameworks/ -sdk %t
-// RUN: %FileCheck %s < %t/deps.json
+// RUN: %validate-json %t/deps.json | %FileCheck %s
 
 import Foo
 
@@ -23,6 +23,7 @@ import Foo
 // CHECK-NEXT:      "directDependencies": [
 // CHECK:      "details": {
 // CHECK-NEXT:        "swiftPrebuiltExternal": {
-// CHECK-NEXT:          "compiledModulePath": 
+// CHECK-NEXT:          "compiledModulePath":
+// CHECK-NEXT:          "userModuleVersion":
 // CHECK-NEXT:          "isFramework": true
 // CHECK-NEXT:        }

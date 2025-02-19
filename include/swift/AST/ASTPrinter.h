@@ -18,6 +18,7 @@
 #include "swift/Basic/UUID.h"
 #include "swift/AST/Identifier.h"
 #include "swift/AST/Decl.h"
+#include "clang/AST/Decl.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/DenseSet.h"
@@ -106,11 +107,35 @@ enum class PrintStructureKind {
   FunctionParameterType,
 };
 
+/// ---------------------------------
+/// MARK: inverse filtering functors
+
+/// An inverse filter is just a function-object. Use one of the functors below
+/// to create such a filter.
+using InverseFilter = std::function<bool(const InverseRequirement &)>;
+
+/// Include all of them!
+class AllInverses {
+public:
+  bool operator()(const InverseRequirement &) const { return true; }
+};
+
+/// Only prints inverses on generic parameters defined in the specified
+/// generic context.
+class InversesAtDepth {
+  std::optional<unsigned> includedDepth;
+public:
+  InversesAtDepth(GenericContext *level);
+  bool operator()(const InverseRequirement &) const;
+};
+/// ---------------------------------
+
 /// An abstract class used to print an AST.
 class ASTPrinter {
   unsigned CurrentIndentation = 0;
   unsigned PendingNewlines = 0;
   TypeOrExtensionDecl SynthesizeTarget;
+  llvm::SmallPtrSet<const clang::Decl *, 8> printedClangDecl;
 
   void printTextImpl(StringRef Text);
 
@@ -128,7 +153,8 @@ public:
   /// Called before printing of a declaration.
   ///
   /// Callers should use callPrintDeclPre().
-  virtual void printDeclPre(const Decl *D, Optional<BracketOptions> Bracket) {}
+  virtual void printDeclPre(const Decl *D,
+                            std::optional<BracketOptions> Bracket) {}
   /// Called before printing at the point which would be considered the location
   /// of the declaration (normally the name of the declaration).
   ///
@@ -142,7 +168,8 @@ public:
   /// Called after finishing printing of a declaration.
   ///
   /// Callers should use callPrintDeclPost().
-  virtual void printDeclPost(const Decl *D, Optional<BracketOptions> Bracket) {}
+  virtual void printDeclPost(const Decl *D,
+                             std::optional<BracketOptions> Bracket) {}
 
   /// Called before printing the result type of the declaration. Printer can
   /// replace \p TL to customize the input.
@@ -169,15 +196,15 @@ public:
   virtual void printModuleRef(ModuleEntity Mod, Identifier Name);
 
   /// Called before printing a synthesized extension.
-  virtual void printSynthesizedExtensionPre(const ExtensionDecl *ED,
-                                            TypeOrExtensionDecl NTD,
-                                            Optional<BracketOptions> Bracket) {}
+  virtual void
+  printSynthesizedExtensionPre(const ExtensionDecl *ED, TypeOrExtensionDecl NTD,
+                               std::optional<BracketOptions> Bracket) {}
 
   /// Called after printing a synthesized extension.
-  virtual void printSynthesizedExtensionPost(const ExtensionDecl *ED,
-                                             TypeOrExtensionDecl TargetDecl,
-                                             Optional<BracketOptions> Bracket) {
-  }
+  virtual void
+  printSynthesizedExtensionPost(const ExtensionDecl *ED,
+                                TypeOrExtensionDecl TargetDecl,
+                                std::optional<BracketOptions> Bracket) {}
 
   /// Called before printing a structured entity.
   ///
@@ -228,7 +255,7 @@ public:
   void printKeyword(StringRef name,
                     const PrintOptions &Opts,
                     StringRef Suffix = "") {
-    if (Opts.SkipUnderscoredKeywords && name.startswith("_"))
+    if (Opts.SkipUnderscoredKeywords && name.starts_with("_"))
       return;
     assert(!name.empty() && "Tried to print empty keyword");
     callPrintNamePre(PrintNameContext::Keyword);
@@ -299,10 +326,10 @@ public:
   // MARK: Callback interface wrappers that perform ASTPrinter bookkeeping.
 
    /// Make a callback to printDeclPre(), performing any necessary bookkeeping.
-  void callPrintDeclPre(const Decl *D, Optional<BracketOptions> Bracket);
+  void callPrintDeclPre(const Decl *D, std::optional<BracketOptions> Bracket);
 
   /// Make a callback to printDeclPost(), performing any necessary bookkeeping.
-  void callPrintDeclPost(const Decl *D, Optional<BracketOptions> Bracket) {
+  void callPrintDeclPost(const Decl *D, std::optional<BracketOptions> Bracket) {
     printDeclPost(D, Bracket);
   }
 
@@ -329,6 +356,28 @@ public:
   void callPrintStructurePre(PrintStructureKind Kind, const Decl *D = nullptr) {
     forceNewlines();
     printStructurePre(Kind, D);
+  }
+
+  /// Return true when the given redeclared clang decl is being printed for the
+  /// first time.
+  bool shouldPrintRedeclaredClangDecl(const clang::Decl *d) {
+    return printedClangDecl.insert(d).second;
+  }
+
+  void printLifetimeDependence(
+      std::optional<LifetimeDependenceInfo> lifetimeDependence) {
+    if (!lifetimeDependence.has_value()) {
+      return;
+    }
+    *this << lifetimeDependence->getString();
+  }
+
+  void printLifetimeDependenceAt(
+      ArrayRef<LifetimeDependenceInfo> lifetimeDependencies, unsigned index) {
+    if (auto lifetimeDependence =
+            getLifetimeDependenceFor(lifetimeDependencies, index)) {
+      printLifetimeDependence(*lifetimeDependence);
+    }
   }
 
 private:
@@ -394,6 +443,10 @@ void printWithCompatibilityFeatureChecks(ASTPrinter &printer,
                                          PrintOptions &options,
                                          Decl *decl,
                                          llvm::function_ref<void()> printBody);
+
+/// Determine whether we need to escape the given keyword within the
+/// given context, by wrapping it in backticks.
+bool escapeKeywordInContext(StringRef keyword, PrintNameContext context);
 
 } // namespace swift
 

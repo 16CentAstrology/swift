@@ -1,5 +1,7 @@
 // RUN: %target-swift-frontend -disable-objc-attr-requires-foundation-module -typecheck -verify -import-cf-types -I %S/Inputs/custom-modules %s
 
+// RUN: %target-swift-frontend -disable-objc-attr-requires-foundation-module -typecheck -verify -import-cf-types -enable-experimental-cxx-interop -I %S/Inputs/custom-modules %s
+
 // REQUIRES: objc_interop
 
 import CoreCooling
@@ -14,7 +16,7 @@ func test0(_ fridge: CCRefrigerator) {
 
 func test1(_ power: Unmanaged<CCPowerSupply>) {
   assertUnmanaged(power)
-  let fridge = CCRefrigeratorCreate(power) // expected-error {{cannot convert value of type 'Unmanaged<CCPowerSupply>' to expected argument type 'CCPowerSupply?'}}
+  let fridge = CCRefrigeratorCreate(power) // expected-error {{cannot convert value of type 'Unmanaged<CCPowerSupply>' to expected argument type 'CCPowerSupply'}}
   assertUnmanaged(fridge) // expected-error {{generic parameter 'T' could not be inferred}}
 }
 
@@ -62,9 +64,9 @@ func test9() {
   CCRefrigeratorOpen(fridge)
   let item = CCRefrigeratorGet(fridge, 0).takeUnretainedValue()
   // TODO(diagnostics): In this case we should probably suggest to flip `item` and `fridge`
-  CCRefrigeratorInsert(item, fridge) // expected-error {{cannot convert value of type 'CCItem' to expected argument type 'CCMutableRefrigerator?'}}
-  // expected-error@-1 {{cannot convert value of type 'CCMutableRefrigerator' to expected argument type 'CCItem?'}}
-  CCRefrigeratorInsert(constFridge, item) // expected-error {{cannot convert value of type 'CCRefrigerator' to expected argument type 'CCMutableRefrigerator?'}}
+  CCRefrigeratorInsert(item, fridge) // expected-error {{cannot convert value of type 'CCItem' to expected argument type 'CCMutableRefrigerator'}}
+  // expected-error@-1 {{cannot convert value of type 'CCMutableRefrigerator' to expected argument type 'CCItem'}}
+  CCRefrigeratorInsert(constFridge, item) // expected-error {{cannot convert value of type 'CCRefrigerator' to expected argument type 'CCMutableRefrigerator'}}
   CCRefrigeratorInsert(fridge, item)
   CCRefrigeratorClose(fridge)
 }
@@ -119,12 +121,12 @@ func testOutParametersBad() {
 
   let power: CCPowerSupply?
   CCRefrigeratorGetPowerSupplyIndirect(0, power)
-  // expected-error@-1:40 {{cannot convert value of type 'Int' to expected argument type 'CCRefrigerator?'}}
+  // expected-error@-1:40 {{cannot convert value of type 'Int' to expected argument type 'CCRefrigerator'}}
   // expected-error@-2:43 {{cannot convert value of type 'CCPowerSupply?' to expected argument type 'AutoreleasingUnsafeMutablePointer<CCPowerSupply?>'}}
 
   let item: CCItem?
   CCRefrigeratorGetItemUnaudited(0, 0, item)
-  // expected-error@-1:34 {{cannot convert value of type 'Int' to expected argument type 'CCRefrigerator?'}}
+  // expected-error@-1:34 {{cannot convert value of type 'Int' to expected argument type 'CCRefrigerator'}}
   // expected-error@-2:40 {{cannot convert value of type 'CCItem?' to expected argument type 'UnsafeMutablePointer<Unmanaged<CCItem>?>?'}}
 }
 

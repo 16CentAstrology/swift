@@ -34,8 +34,7 @@ class BasicCalleeAnalysis;
 // global_init attributes.
 enum class InlineSelection {
   Everything,
-  NoGlobalInit, // and no availability semantics calls
-  NoSemanticsAndGlobalInit,
+  NoSemanticsAndEffects,
   OnlyInlineAlways,
 };
 
@@ -71,6 +70,11 @@ inline bool isOptimizableSemanticFunction(SILFunction *function) {
 /// within another semantic function, or from a "trivial" wrapper.
 bool isNestedSemanticCall(FullApplySite apply);
 
+// Strips down simple function conversion operations until a base SILValue is
+// reached.
+//
+// Returns a nullptr if `val` is not a function conversion instruction.
+SILValue stripFunctionConversions(SILValue val);
 } // end swift namespace
 
 //===----------------------------------------------------------------------===//
@@ -425,6 +429,7 @@ public:
       return;
 
     BlockInfoStorage.resize(numBlocks);
+    CBI.analyze(F);
 
     // First step: compute the length of the blocks.
     unsigned BlockIdx = 0;
@@ -452,7 +457,8 @@ public:
 
       if (isa<ReturnInst>(BB.getTerminator()))
         BBInfo->getDistances(0).DistToExit = Length;
-      else if (isa<ThrowInst>(BB.getTerminator()))
+      else if (isa<ThrowInst>(BB.getTerminator()) ||
+               isa<ThrowAddrInst>(BB.getTerminator()))
         BBInfo->getDistances(0).DistToExit = Length + ColdBlockLength;
     }
     // Compute the distances for all loops in the function.

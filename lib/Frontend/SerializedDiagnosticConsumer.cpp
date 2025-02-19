@@ -19,6 +19,7 @@
 #include "swift/Frontend/SerializedDiagnosticConsumer.h"
 #include "swift/AST/DiagnosticConsumer.h"
 #include "swift/AST/DiagnosticsFrontend.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Frontend/PrintingDiagnosticConsumer.h"
@@ -87,11 +88,8 @@ struct SharedState : llvm::RefCountedBase<SharedState> {
   /// The collection of categories used.
   llvm::DenseMap<const char *, unsigned> Categories;
 
-  using DiagFlagsTy =
-      llvm::DenseMap<const void *, std::pair<unsigned, StringRef>>;
-
-  /// Map for uniquing strings.
-  DiagFlagsTy DiagFlags;
+  /// The collection of flags used.
+  llvm::StringMap<unsigned> Flags;
 
   /// Whether we have already started emission of any DIAG blocks. Once
   /// this becomes \c true, we never close a DIAG block until we know that we're
@@ -103,12 +101,15 @@ struct SharedState : llvm::RefCountedBase<SharedState> {
 class SerializedDiagnosticConsumer : public DiagnosticConsumer {
   /// State shared among the various clones of this diagnostic consumer.
   llvm::IntrusiveRefCntPtr<SharedState> State;
+  bool EmitMacroExpansionFiles = false;
   bool CalledFinishProcessing = false;
   bool CompilationWasComplete = true;
 
 public:
-  SerializedDiagnosticConsumer(StringRef serializedDiagnosticsPath)
-      : State(new SharedState(serializedDiagnosticsPath)) {
+  SerializedDiagnosticConsumer(StringRef serializedDiagnosticsPath,
+                               bool emitMacroExpansionFiles)
+      : State(new SharedState(serializedDiagnosticsPath)),
+        EmitMacroExpansionFiles(emitMacroExpansionFiles) {
     emitPreamble();
   }
 
@@ -195,6 +196,14 @@ private:
   // Record identifier for the category.
   unsigned getEmitCategory(StringRef Category);
 
+  /// Emit a flag record that contains a semi-colon separated
+  /// list of all of the educational notes associated with the
+  /// diagnostic or `0` if there are no notes.
+  ///
+  /// \returns a flag record identifier that could be embedded in
+  /// other records.
+  unsigned emitEducationalNotes(const DiagnosticInfo &info);
+
   /// Add a source location to a record.
   void addLocToRecord(SourceLoc Loc,
                       SourceManager &SM,
@@ -213,18 +222,35 @@ private:
 
 namespace swift {
 namespace serialized_diagnostics {
-  std::unique_ptr<DiagnosticConsumer> createConsumer(StringRef outputPath) {
-    return std::make_unique<SerializedDiagnosticConsumer>(outputPath);
+  std::unique_ptr<DiagnosticConsumer> createConsumer(
+      StringRef outputPath, bool emitMacroExpansionFiles
+  ) {
+    return std::make_unique<SerializedDiagnosticConsumer>(
+        outputPath, emitMacroExpansionFiles);
   }
 } // namespace serialized_diagnostics
 } // namespace swift
 
+/// Sanitize a filename for the purposes of the serialized diagnostics reader.
+static StringRef sanitizeFilename(
+    StringRef filename, SmallString<32> &scratch) {
+  if (!filename.ends_with("/") && !filename.ends_with("\\"))
+    return filename;
+
+  scratch = filename;
+  scratch += "_operator";
+  return scratch;
+}
+
 unsigned SerializedDiagnosticConsumer::getEmitFile(
     SourceManager &SM, StringRef Filename, unsigned bufferID
 ) {
-  // NOTE: Using Filename.data() here relies on SourceMgr using
-  // const char* as buffer identifiers.  This is fast, but may
-  // be brittle.  We can always switch over to using a StringMap.
+  // FIXME: Using Filename.data() here is wrong, since the provided
+  // SourceManager may not live as long as this consumer (which is
+  // the case if it's a diagnostic produced from building a module
+  // interface). We ought to switch over to using a StringMap once
+  // buffer names are unique (currently not the case for
+  // pretty-printed decl buffers).
   unsigned &existingEntry = State->Files[Filename.data()];
   if (existingEntry)
     return existingEntry;
@@ -239,9 +265,14 @@ unsigned SerializedDiagnosticConsumer::getEmitFile(
   Record.push_back(entry);
   Record.push_back(0); // For legacy.
   Record.push_back(0); // For legacy.
-  Record.push_back(Filename.size());
+  
+  // Sanitize the filename enough that the serialized diagnostics reader won't
+  // reject it.
+  SmallString<32> filenameScratch;
+  auto sanitizedFilename = sanitizeFilename(Filename, filenameScratch);
+  Record.push_back(sanitizedFilename.size());
   State->Stream.EmitRecordWithBlob(State->Abbrevs.get(RECORD_FILENAME),
-                                   Record, Filename.data());
+                                   Record, sanitizedFilename.data());
 
   // If the buffer contains code that was synthesized by the compiler,
   // emit the contents of the buffer.
@@ -256,10 +287,10 @@ unsigned SerializedDiagnosticConsumer::getEmitFile(
   // The source range that this buffer was generated from, expressed as
   // offsets into the original buffer.
   if (generatedInfo->originalSourceRange.isValid()) {
-    auto originalFilename = SM.getDisplayNameForLoc(generatedInfo->originalSourceRange.Start);
+    auto originalFilename = SM.getDisplayNameForLoc(generatedInfo->originalSourceRange.getStart(),
+                                EmitMacroExpansionFiles);
     addRangeToRecord(
-        Lexer::getCharSourceRangeFromSourceRange(
-            SM, generatedInfo->originalSourceRange),
+        generatedInfo->originalSourceRange,
         SM, originalFilename, Record
     );
   } else {
@@ -289,9 +320,37 @@ unsigned SerializedDiagnosticConsumer::getEmitCategory(StringRef Category) {
   Record.push_back(entry);
   Record.push_back(Category.size());
   State->Stream.EmitRecordWithBlob(State->Abbrevs.get(RECORD_CATEGORY), Record,
-                                   Category.data());
+                                   Category);
 
   return entry;
+}
+
+unsigned
+SerializedDiagnosticConsumer::emitEducationalNotes(const DiagnosticInfo &Info) {
+  if (Info.EducationalNotePaths.empty())
+    return 0;
+
+  SmallString<32> scratch;
+  interleave(
+      Info.EducationalNotePaths,
+      [&scratch](const auto &notePath) { scratch += notePath; },
+      [&scratch] { scratch += ';'; });
+
+  StringRef paths = scratch.str();
+
+  unsigned &recordID = State->Flags[paths];
+  if (recordID)
+    return recordID;
+
+  recordID = State->Flags.size();
+
+  RecordData Record;
+  Record.push_back(RECORD_DIAG_FLAG);
+  Record.push_back(recordID);
+  Record.push_back(paths.size());
+  State->Stream.EmitRecordWithBlob(State->Abbrevs.get(RECORD_DIAG_FLAG), Record,
+                                   paths);
+  return recordID;
 }
 
 void SerializedDiagnosticConsumer::addLocToRecord(SourceLoc Loc,
@@ -532,7 +591,7 @@ emitDiagnosticMessage(SourceManager &SM,
 
   StringRef filename = "";
   if (Loc.isValid())
-    filename = SM.getDisplayNameForLoc(Loc);
+    filename = SM.getDisplayNameForLoc(Loc, EmitMacroExpansionFiles);
 
   // Emit the RECORD_DIAG record.
   Record.clear();
@@ -547,8 +606,10 @@ emitDiagnosticMessage(SourceManager &SM,
     Record.push_back(0);
   }
 
-  // FIXME: Swift diagnostics currently have no flags.
-  Record.push_back(0);
+  // Use "flags" slot to emit a semi-colon separated list of
+  // educational notes. If there are no notes associated with
+  // this diagnostic `0` placeholder would be emitted instead.
+  Record.push_back(emitEducationalNotes(Info));
 
   // Emit the message.
   Record.push_back(Text.size());

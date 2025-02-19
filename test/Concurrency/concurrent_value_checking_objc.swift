@@ -1,7 +1,8 @@
-// RUN: %target-typecheck-verify-swift  -disable-availability-checking -warn-concurrency
+// RUN: %target-swift-frontend -target %target-swift-5.1-abi-triple -strict-concurrency=complete %s -emit-sil -o /dev/null -verify
 
 // REQUIRES: concurrency
 // REQUIRES: objc_interop
+// REQUIRES: asserts
 
 import Foundation
 

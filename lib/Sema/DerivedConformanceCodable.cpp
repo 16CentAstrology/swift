@@ -18,6 +18,7 @@
 #include "CodeSynthesis.h"
 #include "TypeChecker.h"
 #include "llvm/ADT/STLExtras.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/Module.h"
@@ -25,6 +26,7 @@
 #include "swift/AST/Pattern.h"
 #include "swift/AST/Stmt.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/StringExtras.h"
 #include "DerivedConformances.h"
 
@@ -41,10 +43,8 @@ static bool superclassConformsTo(ClassDecl *target, KnownProtocolKind kpk) {
   if (!superclass)
     return false;
 
-  return !superclass
-              ->getModuleContext()
-              ->lookupConformance(target->getSuperclass(),
-                                  target->getASTContext().getProtocol(kpk))
+  return !lookupConformance(target->getSuperclass(),
+                            target->getASTContext().getProtocol(kpk))
               .isInvalid();
 }
 
@@ -52,8 +52,9 @@ static bool superclassConformsTo(ClassDecl *target, KnownProtocolKind kpk) {
 ///
 /// \param paramIndex if set will be used to generate name in the form of
 ///                   '_$paramIndex' when VarDecl has no name.
-static Identifier getVarNameForCoding(VarDecl *var,
-                                      Optional<int> paramIndex = None) {
+static Identifier
+getVarNameForCoding(VarDecl *var,
+                    std::optional<int> paramIndex = std::nullopt) {
   auto &C = var->getASTContext();
   Identifier identifier;
   if (auto *PD = dyn_cast<ParamDecl>(var)) {
@@ -269,8 +270,7 @@ static EnumDecl *validateCodingKeysType(const DerivedConformance &derived,
 
   // Ensure that the type we found conforms to the CodingKey protocol.
   auto *codingKeyProto = C.getProtocol(KnownProtocolKind::CodingKey);
-  if (!TypeChecker::conformsToProtocol(codingKeysType, codingKeyProto,
-                                       derived.getParentModule())) {
+  if (!lookupConformance(codingKeysType, codingKeyProto)) {
     // If CodingKeys is a typealias which doesn't point to a valid nominal type,
     // codingKeysTypeDecl will be nullptr here. In that case, we need to warn on
     // the location of the usage, since there isn't an underlying type to
@@ -337,12 +337,10 @@ static bool validateCodingKeysEnum(const DerivedConformance &derived,
     // We have a property to map to. Ensure it's {En,De}codable.
     auto target = derived.getConformanceContext()->mapTypeIntoContext(
          it->second->getValueInterfaceType());
-    if (TypeChecker::conformsToProtocol(target, derived.Protocol,
-                                        derived.getParentModule())
-            .isInvalid()) {
+    if (checkConformance(target, derived.Protocol).isInvalid()) {
       TypeLoc typeLoc = {
           it->second->getTypeReprOrParentPatternTypeRepr(),
-          it->second->getType(),
+          it->second->getTypeInContext(),
       };
 
       auto var = it->second;
@@ -674,7 +672,7 @@ static CallExpr *createNestedContainerKeyedByForKeyCall(
 static ThrowStmt *createThrowCodingErrorStmt(ASTContext &C, Expr *containerExpr,
                                              NominalTypeDecl *errorDecl,
                                              Identifier errorId,
-                                             Optional<Expr *> argument,
+                                             std::optional<Expr *> argument,
                                              StringRef debugMessage) {
   auto *contextDecl = lookupErrorContext(C, errorDecl);
   assert(contextDecl && "Missing Context decl.");
@@ -938,7 +936,7 @@ createEnumSwitch(ASTContext &C, DeclContext *DC, Expr *expr, EnumDecl *enumDecl,
     // .<elt>(let a0, let a1, ...)
     SmallVector<VarDecl *, 3> payloadVars;
     Pattern *subpattern = nullptr;
-    Optional<MutableArrayRef<VarDecl *>> caseBodyVarDecls;
+    std::optional<MutableArrayRef<VarDecl *>> caseBodyVarDecls;
 
     if (createSubpattern) {
       subpattern = DerivedConformance::enumElementPayloadSubpattern(
@@ -971,19 +969,17 @@ createEnumSwitch(ASTContext &C, DeclContext *DC, Expr *expr, EnumDecl *enumDecl,
 
     if (caseBody) {
       // generate: case .<Case>:
-      auto pat = new (C) EnumElementPattern(
-          TypeExpr::createImplicit(
-              DC->mapTypeIntoContext(
-                  targetElt->getParentEnum()->getDeclaredInterfaceType()),
-              C),
-          SourceLoc(), DeclNameLoc(), DeclNameRef(), targetElt, subpattern);
-      pat->setImplicit();
+      auto parentTy = DC->mapTypeIntoContext(
+          targetElt->getParentEnum()->getDeclaredInterfaceType());
+      auto *pat = EnumElementPattern::createImplicit(parentTy, targetElt,
+                                                     subpattern, DC);
 
       auto labelItem = CaseLabelItem(pat);
-      auto stmt = CaseStmt::create(
-          C, CaseParentKind::Switch, SourceLoc(), labelItem, SourceLoc(),
-          SourceLoc(), caseBody,
-          /*case body vardecls*/ createSubpattern ? caseBodyVarDecls : None);
+      auto stmt =
+          CaseStmt::create(C, CaseParentKind::Switch, SourceLoc(), labelItem,
+                           SourceLoc(), SourceLoc(), caseBody,
+                           /*case body vardecls*/
+                           createSubpattern ? caseBodyVarDecls : std::nullopt);
       cases.push_back(stmt);
     }
   }
@@ -1109,9 +1105,18 @@ deriveBodyEncodable_enum_encode(AbstractFunctionDecl *encodeDecl, void *) {
   auto switchStmt = createEnumSwitch(
       C, funcDC, enumRef, enumDecl, codingKeysEnum,
       /*createSubpattern*/ true,
-      [&](auto *elt, auto *codingKeyCase,
-          auto payloadVars) -> std::tuple<EnumElementDecl *, BraceStmt *> {
+      [&](EnumElementDecl *elt, EnumElementDecl *codingKeyCase,
+          ArrayRef<VarDecl *> payloadVars)
+          -> std::tuple<EnumElementDecl *, BraceStmt *> {
         SmallVector<ASTNode, 3> caseStatements;
+
+        if (elt->isUnavailable()) {
+          // This case is not encodable because it is unavailable and therefore
+          // should not be instantiable at runtime. Skipping this case will
+          // result in the SIL pipeline giving the switch a default case for
+          // unexpected values.
+          return std::make_tuple(nullptr, nullptr);
+        }
 
         if (!codingKeyCase) {
           // This case should not be encodable, so throw an error if an attempt
@@ -1230,7 +1235,8 @@ static FuncDecl *deriveEncodable_encode(DerivedConformance &derived) {
   auto *const encodeDecl = FuncDecl::createImplicit(
       C, StaticSpellingKind::None, name, /*NameLoc=*/SourceLoc(),
       /*Async=*/false,
-      /*Throws=*/true, /*GenericParams=*/nullptr, params, returnType,
+      /*Throws=*/true, /*ThrownType=*/Type(),
+      /*GenericParams=*/nullptr, params, returnType,
       conformanceDC);
   encodeDecl->setSynthesized();
 
@@ -1248,7 +1254,7 @@ static FuncDecl *deriveEncodable_encode(DerivedConformance &derived) {
     encodeDecl->getAttrs().add(attr);
   }
 
-  addNonIsolatedToSynthesized(derived.Nominal, encodeDecl);
+  addNonIsolatedToSynthesized(derived, encodeDecl);
 
   encodeDecl->copyFormalAccessFrom(derived.Nominal,
                                    /*sourceIsParentContext*/ true);
@@ -1396,8 +1402,8 @@ deriveBodyDecodable_init(AbstractFunctionDecl *initDecl, void *) {
             });
         auto *encodableProto = C.getProtocol(KnownProtocolKind::Encodable);
         bool conformsToEncodable =
-            conformanceDC->getParentModule()->lookupConformance(
-                targetDecl->getDeclaredInterfaceType(), encodableProto) != nullptr;
+            (bool) lookupConformance(
+                targetDecl->getDeclaredInterfaceType(), encodableProto);
 
         // Strategy to use for CodingKeys enum diagnostic part - this is to
         // make the behaviour more explicit:
@@ -1538,11 +1544,13 @@ deriveBodyDecodable_enum_init(AbstractFunctionDecl *initDecl, void *) {
   // enum Foo : Codable {
   //   case bar(x: Int)
   //   case baz(y: String)
+  //   @available(*, unavailable) case qux(z: Double)
   //
   //   // Already derived by this point if possible.
   //   @derived enum CodingKeys : CodingKey {
   //     case bar
   //     case baz
+  //     case qux
   //
   //     @derived enum BarCodingKeys : CodingKey {
   //       case x
@@ -1550,6 +1558,10 @@ deriveBodyDecodable_enum_init(AbstractFunctionDecl *initDecl, void *) {
   //
   //     @derived enum BazCodingKeys : CodingKey {
   //       case y
+  //     }
+  //
+  //     @derived enum QuxCodingKeys : CodingKey {
+  //       case z
   //     }
   //   }
   //
@@ -1570,9 +1582,15 @@ deriveBodyDecodable_enum_init(AbstractFunctionDecl *initDecl, void *) {
   //       self = .bar(x: x)
   //     case .baz:
   //       let nestedContainer = try container.nestedContainer(
-  //           keyedBy: BarCodingKeys.self, forKey: .baz)
+  //           keyedBy: BazCodingKeys.self, forKey: .baz)
   //       let y = try nestedContainer.decode(String.self, forKey: .y)
   //       self = .baz(y: y)
+  //     case .qux:
+  //       throw DecodingError.dataCorrupted(
+  //         DecodingError.Context(
+  //           codingPath: decoder.codingPath,
+  //           debugDescription: "Unavailable enum element encountered.")
+  //       )
   //     }
   //   }
 
@@ -1650,10 +1668,11 @@ deriveBodyDecodable_enum_init(AbstractFunctionDecl *initDecl, void *) {
           C, UnresolvedDotExpr::createImplicit(C, allKeysExpr, C.Id_popFirst));
 
       auto *theKeyPattern = BindingPattern::createImplicit(
-          C, /*isLet=*/true, NamedPattern::createImplicit(C, theKeyDecl));
+          C, VarDecl::Introducer::Let,
+          NamedPattern::createImplicit(C, theKeyDecl));
 
-      guardElements.emplace_back(SourceLoc(), theKeyPattern,
-                                 allKeysPopFirstCallExpr);
+      guardElements.emplace_back(ConditionalPatternBindingInfo::create(
+          C, SourceLoc(), theKeyPattern, allKeysPopFirstCallExpr));
 
       // generate: allKeys.isEmpty;
       auto *allKeysIsEmptyExpr =
@@ -1687,14 +1706,30 @@ deriveBodyDecodable_enum_init(AbstractFunctionDecl *initDecl, void *) {
     auto switchStmt = createEnumSwitch(
         C, funcDC, theKeyExpr, targetEnum, codingKeysEnum,
         /*createSubpattern*/ false,
-        [&](auto *elt, auto *codingKeyCase,
-            auto payloadVars) -> std::tuple<EnumElementDecl *, BraceStmt *> {
+        [&](EnumElementDecl *elt, EnumElementDecl *codingKeyCase,
+            ArrayRef<VarDecl *> payloadVars)
+            -> std::tuple<EnumElementDecl *, BraceStmt *> {
           // Skip this case if it's not defined in the CodingKeys
           if (!codingKeyCase)
             return std::make_tuple(nullptr, nullptr);
 
-          llvm::SmallVector<ASTNode, 3> caseStatements;
+          if (elt->isUnavailable()) {
+            // generate:
+            //       throw DecodingError.dataCorrupted(
+            //         DecodingError.Context(
+            //           codingPath: decoder.codingPath,
+            //           debugDescription: "...")
+            auto *throwStmt = createThrowCodingErrorStmt(
+                C, containerExpr, C.getDecodingErrorDecl(), C.Id_dataCorrupted,
+                std::nullopt, "Unavailable enum element encountered.");
 
+            auto body =
+                BraceStmt::create(C, SourceLoc(), {throwStmt}, SourceLoc());
+
+            return std::make_tuple(codingKeyCase, body);
+          }
+
+          llvm::SmallVector<ASTNode, 3> caseStatements;
           auto caseIdentifier = caseCodingKeysIdentifier(C, elt);
           auto *caseCodingKeys =
               lookupEvaluatedCodingKeysEnum(C, targetEnum, caseIdentifier);
@@ -1850,9 +1885,10 @@ static ValueDecl *deriveDecodable_init(DerivedConformance &derived) {
 
   auto *initDecl =
       new (C) ConstructorDecl(name, SourceLoc(),
-                              /*Failable=*/false,SourceLoc(),
+                              /*Failable=*/false, SourceLoc(),
                               /*Async=*/false, /*AsyncLoc=*/SourceLoc(),
-                              /*Throws=*/true, SourceLoc(), paramList,
+                              /*Throws=*/true, SourceLoc(),
+                              /*ThrownType=*/TypeLoc(), paramList,
                               /*GenericParams=*/nullptr, conformanceDC);
   initDecl->setImplicit();
   initDecl->setSynthesized();
@@ -1869,7 +1905,7 @@ static ValueDecl *deriveDecodable_init(DerivedConformance &derived) {
     initDecl->getAttrs().add(reqAttr);
   }
 
-  addNonIsolatedToSynthesized(derived.Nominal, initDecl);
+  addNonIsolatedToSynthesized(derived, initDecl);
 
   initDecl->copyFormalAccessFrom(derived.Nominal,
                                  /*sourceIsParentContext*/ true);
@@ -1903,8 +1939,7 @@ static bool canSynthesize(DerivedConformance &derived, ValueDecl *requirement,
     if (auto *superclassDecl = classDecl->getSuperclassDecl()) {
       DeclName memberName;
       auto superType = superclassDecl->getDeclaredInterfaceType();
-      if (TypeChecker::conformsToProtocol(superType, proto,
-                                          derived.getParentModule())) {
+      if (checkConformance(superType, proto)) {
         // super.init(from:) must be accessible.
         memberName = cast<ConstructorDecl>(requirement)->getName();
       } else {
@@ -2047,12 +2082,6 @@ static bool canDeriveCodable(NominalTypeDecl *NTD,
     return false;
   }
 
-  // Actor-isolated structs and classes cannot derive encodable/decodable
-  // unless all of their stored properties are immutable.
-  if ((isa<StructDecl>(NTD) || isa<ClassDecl>(NTD)) &&
-      memberwiseAccessorsRequireActorIsolation(NTD))
-    return false;
-
   return true;
 }
 
@@ -2086,8 +2115,7 @@ ValueDecl *DerivedConformance::deriveEncodable(ValueDecl *requirement) {
     ConformanceDecl->diagnose(diag::type_does_not_conform,
                               Nominal->getDeclaredType(), getProtocolType());
     requirement->diagnose(diag::no_witnesses, diag::RequirementKind::Func,
-                          requirement->getName(), getProtocolType(),
-                          /*AddFixIt=*/false);
+                          requirement, getProtocolType());
 
     return nullptr;
   }
@@ -2102,7 +2130,7 @@ ValueDecl *DerivedConformance::deriveDecodable(ValueDecl *requirement) {
       !isa<EnumDecl>(Nominal))
     return nullptr;
 
-  if (requirement->getBaseName() != DeclBaseName::createConstructor()) {
+  if (!requirement->getBaseName().isConstructor()) {
     // Unknown requirement.
     requirement->diagnose(diag::broken_decodable_requirement);
     return nullptr;
@@ -2117,9 +2145,9 @@ ValueDecl *DerivedConformance::deriveDecodable(ValueDecl *requirement) {
   if (!canSynthesize(*this, requirement, delayedNotes)) {
     ConformanceDecl->diagnose(diag::type_does_not_conform,
                               Nominal->getDeclaredType(), getProtocolType());
-    requirement->diagnose(diag::no_witnesses, diag::RequirementKind::Constructor,
-                          requirement->getName(), getProtocolType(),
-                          /*AddFixIt=*/false);
+    requirement->diagnose(diag::no_witnesses,
+                          diag::RequirementKind::Constructor, requirement,
+                          getProtocolType());
 
     return nullptr;
   }

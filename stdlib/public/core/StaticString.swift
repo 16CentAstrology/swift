@@ -205,7 +205,11 @@ public struct StaticString: Sendable {
       return body(UnsafeBufferPointer(
         start: utf8Start, count: utf8CodeUnitCount))
     } else {
+      #if $Embedded
+      fatalError("non-pointer representation not supported in embedded Swift")
+      #else
       return unicodeScalar.withUTF8CodeUnits { body($0) }
+      #endif
     }
   }
 }

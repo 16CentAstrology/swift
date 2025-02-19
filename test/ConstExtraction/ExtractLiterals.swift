@@ -43,6 +43,9 @@ public struct PropertyWrappers : MyProto {
 
     @Buffered @Clamping(min: 0, max: 255)
     var propertyWrapper3: Int = 128
+
+    @Buffered
+    var propertyWrapper4: String    
 }
 
 @propertyWrapper
@@ -91,16 +94,34 @@ public struct PropertyWrappers : MyProto {
      var projectedValue: (V, V?) { (self.value, self.lastValue) }
 }
 
+public struct Optionals: MyProto {
+    let int1: Bool? = nil
+    let string1: String?
+    static var float1: Float?
+}
+
 // CHECK: [
 // CHECK-NEXT:  {
 // CHECK-NEXT:    "typeName": "ExtractLiterals.Bools",
+// CHECK-NEXT:    "mangledTypeName": "15ExtractLiterals5BoolsV",
 // CHECK-NEXT:    "kind": "struct",
 // CHECK-NEXT:    "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
 // CHECK-NEXT:    "line": 9,
+// CHECK-NEXT:    "conformances": [
+// CHECK-NEXT:      "ExtractLiterals.MyProto"
+// CHECK-NEXT:    ],
+// CHECK-NEXT:    "allConformances": [
+// CHECK-NEXT:      {
+// CHECK-NEXT:        "protocolName": "ExtractLiterals.MyProto"
+// CHECK-NEXT:        "conformanceDefiningModule": "ExtractLiterals"
+// CHECK-NEXT:      }
+// CHECK-NEXT:    ],
+// CHECK-NEXT:    "associatedTypeAliases": [],
 // CHECK-NEXT:    "properties": [
 // CHECK-NEXT:      {
 // CHECK-NEXT:        "label": "bool1",
 // CHECK-NEXT:        "type": "Swift.Bool",
+// CHECK-NEXT:        "mangledTypeName": "n/a - deprecated",
 // CHECK-NEXT:        "isStatic": "false",
 // CHECK-NEXT:        "isComputed": "false",
 // CHECK-NEXT:        "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
@@ -110,25 +131,37 @@ public struct PropertyWrappers : MyProto {
 // CHECK-NEXT:      },
 // CHECK-NEXT:      {
 // CHECK-NEXT:        "label": "bool2",
-// CHECK-NEXT:        "type": "Swift.Bool?",
+// CHECK-NEXT:        "type": "Swift.Optional<Swift.Bool>",
+// CHECK-NEXT:        "mangledTypeName": "n/a - deprecated",
 // CHECK-NEXT:        "isStatic": "false",
 // CHECK-NEXT:        "isComputed": "false",
 // CHECK-NEXT:        "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
 // CHECK-NEXT:        "line": 11,
-// CHECK-NEXT:        "valueKind": "RawLiteral",
-// CHECK-NEXT:        "value": "nil"
+// CHECK-NEXT:        "valueKind": "NilLiteral"
 // CHECK-NEXT:      }
 // CHECK-NEXT:    ]
 // CHECK-NEXT:  },
 // CHECK-NEXT:  {
 // CHECK-NEXT:    "typeName": "ExtractLiterals.Ints",
+// CHECK-NEXT:    "mangledTypeName": "15ExtractLiterals4IntsV",
 // CHECK-NEXT:    "kind": "struct",
 // CHECK-NEXT:    "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
 // CHECK-NEXT:    "line": 14,
+// CHECK-NEXT:    "conformances": [
+// CHECK-NEXT:      "ExtractLiterals.MyProto"
+// CHECK-NEXT:    ],
+// CHECK-NEXT:    "allConformances": [
+// CHECK-NEXT:      {
+// CHECK-NEXT:        "protocolName": "ExtractLiterals.MyProto"
+// CHECK-NEXT:        "conformanceDefiningModule": "ExtractLiterals"
+// CHECK-NEXT:      }
+// CHECK-NEXT:    ],
+// CHECK-NEXT:    "associatedTypeAliases": [],
 // CHECK-NEXT:    "properties": [
 // CHECK-NEXT:      {
 // CHECK-NEXT:        "label": "int1",
 // CHECK-NEXT:        "type": "Swift.Int",
+// CHECK-NEXT:        "mangledTypeName": "n/a - deprecated",
 // CHECK-NEXT:        "isStatic": "true",
 // CHECK-NEXT:        "isComputed": "false",
 // CHECK-NEXT:        "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
@@ -139,6 +172,7 @@ public struct PropertyWrappers : MyProto {
 // CHECK-NEXT:      {
 // CHECK-NEXT:        "label": "int2",
 // CHECK-NEXT:        "type": "Swift.Int",
+// CHECK-NEXT:        "mangledTypeName": "n/a - deprecated",
 // CHECK-NEXT:        "isStatic": "false",
 // CHECK-NEXT:        "isComputed": "true",
 // CHECK-NEXT:        "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
@@ -149,6 +183,7 @@ public struct PropertyWrappers : MyProto {
 // CHECK-NEXT:      {
 // CHECK-NEXT:        "label": "int3",
 // CHECK-NEXT:        "type": "Swift.Int",
+// CHECK-NEXT:        "mangledTypeName": "n/a - deprecated",
 // CHECK-NEXT:        "isStatic": "true",
 // CHECK-NEXT:        "isComputed": "true",
 // CHECK-NEXT:        "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
@@ -160,13 +195,25 @@ public struct PropertyWrappers : MyProto {
 // CHECK-NEXT:  },
 // CHECK-NEXT:  {
 // CHECK-NEXT:    "typeName": "ExtractLiterals.Floats",
+// CHECK-NEXT:    "mangledTypeName": "15ExtractLiterals6FloatsV",
 // CHECK-NEXT:    "kind": "struct",
 // CHECK-NEXT:    "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
 // CHECK-NEXT:    "line": 20,
+// CHECK-NEXT:    "conformances": [
+// CHECK-NEXT:      "ExtractLiterals.MyProto"
+// CHECK-NEXT:    ],
+// CHECK-NEXT:    "allConformances": [
+// CHECK-NEXT:      {
+// CHECK-NEXT:        "protocolName": "ExtractLiterals.MyProto"
+// CHECK-NEXT:        "conformanceDefiningModule": "ExtractLiterals"
+// CHECK-NEXT:      }
+// CHECK-NEXT:    ],
+// CHECK-NEXT:    "associatedTypeAliases": [],
 // CHECK-NEXT:    "properties": [
 // CHECK-NEXT:      {
 // CHECK-NEXT:        "label": "float1",
 // CHECK-NEXT:        "type": "Swift.Float",
+// CHECK-NEXT:        "mangledTypeName": "n/a - deprecated",
 // CHECK-NEXT:        "isStatic": "true",
 // CHECK-NEXT:        "isComputed": "false",
 // CHECK-NEXT:        "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
@@ -177,6 +224,7 @@ public struct PropertyWrappers : MyProto {
 // CHECK-NEXT:      {
 // CHECK-NEXT:        "label": "float2",
 // CHECK-NEXT:        "type": "Swift.Float",
+// CHECK-NEXT:        "mangledTypeName": "n/a - deprecated",
 // CHECK-NEXT:        "isStatic": "true",
 // CHECK-NEXT:        "isComputed": "true",
 // CHECK-NEXT:        "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
@@ -187,6 +235,7 @@ public struct PropertyWrappers : MyProto {
 // CHECK-NEXT:      {
 // CHECK-NEXT:        "label": "float3",
 // CHECK-NEXT:        "type": "Swift.Float",
+// CHECK-NEXT:        "mangledTypeName": "n/a - deprecated",
 // CHECK-NEXT:        "isStatic": "true",
 // CHECK-NEXT:        "isComputed": "true",
 // CHECK-NEXT:        "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
@@ -197,13 +246,25 @@ public struct PropertyWrappers : MyProto {
 // CHECK-NEXT:  },
 // CHECK-NEXT:  {
 // CHECK-NEXT:    "typeName": "ExtractLiterals.Strings",
+// CHECK-NEXT:    "mangledTypeName": "15ExtractLiterals7StringsV",
 // CHECK-NEXT:    "kind": "struct",
 // CHECK-NEXT:    "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
 // CHECK-NEXT:    "line": 26,
+// CHECK-NEXT:    "conformances": [
+// CHECK-NEXT:      "ExtractLiterals.MyProto"
+// CHECK-NEXT:    ],
+// CHECK-NEXT:    "allConformances": [
+// CHECK-NEXT:      {
+// CHECK-NEXT:        "protocolName": "ExtractLiterals.MyProto"
+// CHECK-NEXT:        "conformanceDefiningModule": "ExtractLiterals"
+// CHECK-NEXT:      }
+// CHECK-NEXT:    ],
+// CHECK-NEXT:    "associatedTypeAliases": [],
 // CHECK-NEXT:    "properties": [
 // CHECK-NEXT:      {
 // CHECK-NEXT:        "label": "string1",
 // CHECK-NEXT:        "type": "Swift.String",
+// CHECK-NEXT:        "mangledTypeName": "n/a - deprecated",
 // CHECK-NEXT:        "isStatic": "false",
 // CHECK-NEXT:        "isComputed": "false",
 // CHECK-NEXT:        "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
@@ -214,6 +275,7 @@ public struct PropertyWrappers : MyProto {
 // CHECK-NEXT:      {
 // CHECK-NEXT:        "label": "string2",
 // CHECK-NEXT:        "type": "Swift.String",
+// CHECK-NEXT:        "mangledTypeName": "n/a - deprecated",
 // CHECK-NEXT:        "isStatic": "false",
 // CHECK-NEXT:        "isComputed": "false",
 // CHECK-NEXT:        "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
@@ -224,6 +286,7 @@ public struct PropertyWrappers : MyProto {
 // CHECK-NEXT:      {
 // CHECK-NEXT:        "label": "string3",
 // CHECK-NEXT:        "type": "Swift.String",
+// CHECK-NEXT:        "mangledTypeName": "n/a - deprecated",
 // CHECK-NEXT:        "isStatic": "false",
 // CHECK-NEXT:        "isComputed": "true",
 // CHECK-NEXT:        "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
@@ -235,56 +298,161 @@ public struct PropertyWrappers : MyProto {
 // CHECK-NEXT:  },
 // CHECK-NEXT:  {
 // CHECK-NEXT:    "typeName": "ExtractLiterals.PropertyWrappers",
+// CHECK-NEXT:    "mangledTypeName": "15ExtractLiterals16PropertyWrappersV",
 // CHECK-NEXT:    "kind": "struct",
 // CHECK-NEXT:    "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
 // CHECK-NEXT:    "line": 37,
+// CHECK-NEXT:    "conformances": [
+// CHECK-NEXT:      "ExtractLiterals.MyProto"
+// CHECK-NEXT:    ],
+// CHECK-NEXT:    "allConformances": [
+// CHECK-NEXT:      {
+// CHECK-NEXT:        "protocolName": "ExtractLiterals.MyProto"
+// CHECK-NEXT:        "conformanceDefiningModule": "ExtractLiterals"
+// CHECK-NEXT:      }
+// CHECK-NEXT:    ],
+// CHECK-NEXT:    "associatedTypeAliases": [],
 // CHECK-NEXT:    "properties": [
 // CHECK-NEXT:      {
 // CHECK-NEXT:        "label": "_propertyWrapper1",
 // CHECK-NEXT:        "type": "ExtractLiterals.Buffered<Swift.String>",
+// CHECK-NEXT:        "mangledTypeName": "n/a - deprecated",
 // CHECK-NEXT:        "isStatic": "false",
 // CHECK-NEXT:        "isComputed": "false",
 // CHECK-NEXT:        "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
 // CHECK-NEXT:        "line": 39,
-// CHECK-NEXT:        "valueKind": "Runtime"
+// CHECK-NEXT:        "valueKind": "InitCall",
+// CHECK-NEXT:        "value": {
+// CHECK-NEXT:          "type": "ExtractLiterals.Buffered<Swift.String>",
+// CHECK-NEXT:          "arguments": [
+// CHECK-NEXT:            {
+// CHECK-NEXT:              "label": "wrappedValue",
+// CHECK-NEXT:              "type": "Swift.String",
+// CHECK-NEXT:              "valueKind": "RawLiteral",
+// CHECK-NEXT:              "value": "Hello"
+// CHECK-NEXT:            }
+// CHECK-NEXT:          ]
+// CHECK-NEXT:        }
 // CHECK-NEXT:      },
 // CHECK-NEXT:      {
 // CHECK-NEXT:        "label": "_propertyWrapper2",
 // CHECK-NEXT:        "type": "ExtractLiterals.Clamping<Swift.Int>",
+// CHECK-NEXT:        "mangledTypeName": "n/a - deprecated",
 // CHECK-NEXT:        "isStatic": "false",
 // CHECK-NEXT:        "isComputed": "false",
 // CHECK-NEXT:        "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
 // CHECK-NEXT:        "line": 42,
-// CHECK-NEXT:        "valueKind": "Runtime"
+// CHECK-NEXT:        "valueKind": "InitCall",
+// CHECK-NEXT:        "value": {
+// CHECK-NEXT:          "type": "ExtractLiterals.Clamping<Swift.Int>",
+// CHECK-NEXT:          "arguments": [
+// CHECK-NEXT:            {
+// CHECK-NEXT:              "label": "wrappedValue",
+// CHECK-NEXT:              "type": "Swift.Int",
+// CHECK-NEXT:              "valueKind": "RawLiteral",
+// CHECK-NEXT:              "value": "128"
+// CHECK-NEXT:            },
+// CHECK-NEXT:            {
+// CHECK-NEXT:              "label": "min",
+// CHECK-NEXT:              "type": "Swift.Int",
+// CHECK-NEXT:              "valueKind": "RawLiteral",
+// CHECK-NEXT:              "value": "0"
+// CHECK-NEXT:            },
+// CHECK-NEXT:            {
+// CHECK-NEXT:              "label": "max",
+// CHECK-NEXT:              "type": "Swift.Int",
+// CHECK-NEXT:              "valueKind": "RawLiteral",
+// CHECK-NEXT:              "value": "255"
+// CHECK-NEXT:            }
+// CHECK-NEXT:          ]
+// CHECK-NEXT:        }
 // CHECK-NEXT:      },
 // CHECK-NEXT:      {
 // CHECK-NEXT:        "label": "_propertyWrapper3",
 // CHECK-NEXT:        "type": "ExtractLiterals.Buffered<ExtractLiterals.Clamping<Swift.Int>>",
+// CHECK-NEXT:        "mangledTypeName": "n/a - deprecated",
 // CHECK-NEXT:        "isStatic": "false",
 // CHECK-NEXT:        "isComputed": "false",
 // CHECK-NEXT:        "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
 // CHECK-NEXT:        "line": 45,
+// CHECK-NEXT:        "valueKind": "InitCall",
+// CHECK-NEXT:        "value": {
+// CHECK-NEXT:          "type": "ExtractLiterals.Buffered<ExtractLiterals.Clamping<Swift.Int>>",
+// CHECK-NEXT:          "arguments": [
+// CHECK-NEXT:            {
+// CHECK-NEXT:              "label": "wrappedValue",
+// CHECK-NEXT:              "type": "ExtractLiterals.Clamping<Swift.Int>",
+// CHECK-NEXT:              "valueKind": "InitCall",
+// CHECK-NEXT:              "value": {
+// CHECK-NEXT:                "type": "ExtractLiterals.Clamping<Swift.Int>",
+// CHECK-NEXT:                "arguments": [
+// CHECK-NEXT:                  {
+// CHECK-NEXT:                    "label": "wrappedValue",
+// CHECK-NEXT:                    "type": "Swift.Int",
+// CHECK-NEXT:                    "valueKind": "RawLiteral"
+// CHECK-NEXT:                    "value": "128"
+// CHECK-NEXT:                  },
+// CHECK-NEXT:                  {
+// CHECK-NEXT:                    "label": "min",
+// CHECK-NEXT:                    "type": "Swift.Int",
+// CHECK-NEXT:                    "valueKind": "RawLiteral",
+// CHECK-NEXT:                    "value": "0"
+// CHECK-NEXT:                  },
+// CHECK-NEXT:                  {
+// CHECK-NEXT:                    "label": "max",
+// CHECK-NEXT:                    "type": "Swift.Int",
+// CHECK-NEXT:                    "valueKind": "RawLiteral",
+// CHECK-NEXT:                    "value": "255"
+// CHECK-NEXT:                  }
+// CHECK-NEXT:                ]
+// CHECK-NEXT:              }
+// CHECK-NEXT:            }
+// CHECK-NEXT:          ]
+// CHECK-NEXT:        }
+// CHECK-NEXT:      },
+// CHECK-NEXT:      {
+// CHECK-NEXT:        "label": "_propertyWrapper4",
+// CHECK-NEXT:        "type": "ExtractLiterals.Buffered<Swift.String>",
+// CHECK-NEXT:        "mangledTypeName": "n/a - deprecated",
+// CHECK-NEXT:        "isStatic": "false",
+// CHECK-NEXT:        "isComputed": "false",
+// CHECK-NEXT:        "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
+// CHECK-NEXT:        "line": 48,
 // CHECK-NEXT:        "valueKind": "Runtime"
 // CHECK-NEXT:      },
 // CHECK-NEXT:      {
 // CHECK-NEXT:        "label": "propertyWrapper1",
 // CHECK-NEXT:        "type": "Swift.String",
+// CHECK-NEXT:        "mangledTypeName": "n/a - deprecated",
 // CHECK-NEXT:        "isStatic": "false",
 // CHECK-NEXT:        "isComputed": "true",
 // CHECK-NEXT:        "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
 // CHECK-NEXT:        "line": 39,
-// CHECK-NEXT:        "valueKind": "RawLiteral",
-// CHECK-NEXT:        "value": "Hello",
-// CHECK-NEXT:        "attributes": [
+// CHECK-NEXT:        "valueKind": "InitCall",
+// CHECK-NEXT:        "value": {
+// CHECK-NEXT:          "type": "ExtractLiterals.Buffered<Swift.String>",
+// CHECK-NEXT:          "arguments": [
+// CHECK-NEXT:            {
+// CHECK-NEXT:              "label": "wrappedValue",
+// CHECK-NEXT:              "type": "Swift.String",
+// CHECK-NEXT:              "valueKind": "RawLiteral",
+// CHECK-NEXT:              "value": "Hello"
+// CHECK-NEXT:            }
+// CHECK-NEXT:          ]
+// CHECK-NEXT:        },
+// CHECK-NEXT:        "propertyWrappers": [
 // CHECK-NEXT:          {
 // CHECK-NEXT:            "type": "ExtractLiterals.Buffered",
+// CHECK-NEXT:            "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
+// CHECK-NEXT:            "line": 38,
 // CHECK-NEXT:            "arguments": []
 // CHECK-NEXT:          }
 // CHECK-NEXT:        ]
 // CHECK-NEXT:      },
 // CHECK-NEXT:      {
 // CHECK-NEXT:        "label": "$propertyWrapper1",
-// CHECK-NEXT:        "type": "(Swift.String, Swift.String?)",
+// CHECK-NEXT:        "type": "(Swift.String, Swift.Optional<Swift.String>)",
+// CHECK-NEXT:        "mangledTypeName": "n/a - deprecated",
 // CHECK-NEXT:        "isStatic": "false",
 // CHECK-NEXT:        "isComputed": "true",
 // CHECK-NEXT:        "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
@@ -294,15 +462,40 @@ public struct PropertyWrappers : MyProto {
 // CHECK-NEXT:      {
 // CHECK-NEXT:        "label": "propertyWrapper2",
 // CHECK-NEXT:        "type": "Swift.Int",
+// CHECK-NEXT:        "mangledTypeName": "n/a - deprecated",
 // CHECK-NEXT:        "isStatic": "false",
 // CHECK-NEXT:        "isComputed": "true",
 // CHECK-NEXT:        "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
 // CHECK-NEXT:        "line": 42,
-// CHECK-NEXT:        "valueKind": "RawLiteral",
-// CHECK-NEXT:        "value": "128",
-// CHECK-NEXT:        "attributes": [
+// CHECK-NEXT:        "valueKind": "InitCall",
+// CHECK-NEXT:        "value": {
+// CHECK-NEXT:          "type": "ExtractLiterals.Clamping<Swift.Int>",
+// CHECK-NEXT:          "arguments": [
+// CHECK-NEXT:            {
+// CHECK-NEXT:              "label": "wrappedValue",
+// CHECK-NEXT:              "type": "Swift.Int",
+// CHECK-NEXT:              "valueKind": "RawLiteral",
+// CHECK-NEXT:              "value": "128"
+// CHECK-NEXT:            },
+// CHECK-NEXT:            {
+// CHECK-NEXT:              "label": "min",
+// CHECK-NEXT:              "type": "Swift.Int",
+// CHECK-NEXT:              "valueKind": "RawLiteral",
+// CHECK-NEXT:              "value": "0"
+// CHECK-NEXT:            },
+// CHECK-NEXT:            {
+// CHECK-NEXT:              "label": "max",
+// CHECK-NEXT:              "type": "Swift.Int",
+// CHECK-NEXT:              "valueKind": "RawLiteral",
+// CHECK-NEXT:              "value": "255"
+// CHECK-NEXT:            }
+// CHECK-NEXT:          ]
+// CHECK-NEXT:        },
+// CHECK-NEXT:        "propertyWrappers": [
 // CHECK-NEXT:          {
 // CHECK-NEXT:            "type": "ExtractLiterals.Clamping",
+// CHECK-NEXT:            "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
+// CHECK-NEXT:            "line": 41,
 // CHECK-NEXT:            "arguments": [
 // CHECK-NEXT:              {
 // CHECK-NEXT:                "label": "min",
@@ -323,19 +516,56 @@ public struct PropertyWrappers : MyProto {
 // CHECK-NEXT:      {
 // CHECK-NEXT:        "label": "propertyWrapper3",
 // CHECK-NEXT:        "type": "Swift.Int",
+// CHECK-NEXT:        "mangledTypeName": "n/a - deprecated",
 // CHECK-NEXT:        "isStatic": "false",
 // CHECK-NEXT:        "isComputed": "true",
 // CHECK-NEXT:        "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
 // CHECK-NEXT:        "line": 45,
-// CHECK-NEXT:        "valueKind": "RawLiteral",
-// CHECK-NEXT:        "value": "128",
-// CHECK-NEXT:        "attributes": [
+// CHECK-NEXT:        "valueKind": "InitCall",
+// CHECK-NEXT:        "value": {
+// CHECK-NEXT:          "type": "ExtractLiterals.Buffered<ExtractLiterals.Clamping<Swift.Int>>",
+// CHECK-NEXT:          "arguments": [
+// CHECK-NEXT:            {
+// CHECK-NEXT:              "label": "wrappedValue",
+// CHECK-NEXT:              "type": "ExtractLiterals.Clamping<Swift.Int>",
+// CHECK-NEXT:              "valueKind": "InitCall",
+// CHECK-NEXT:              "value": {
+// CHECK-NEXT:                "type": "ExtractLiterals.Clamping<Swift.Int>",
+// CHECK-NEXT:                "arguments": [
+// CHECK-NEXT:                  {
+// CHECK-NEXT:                    "label": "wrappedValue",
+// CHECK-NEXT:                    "type": "Swift.Int",
+// CHECK-NEXT:                    "valueKind": "RawLiteral",
+// CHECK-NEXT:                    "value": "128"
+// CHECK-NEXT:                  },
+// CHECK-NEXT:                  {
+// CHECK-NEXT:                    "label": "min",
+// CHECK-NEXT:                    "type": "Swift.Int",
+// CHECK-NEXT:                    "valueKind": "RawLiteral",
+// CHECK-NEXT:                    "value": "0"
+// CHECK-NEXT:                  },
+// CHECK-NEXT:                  {
+// CHECK-NEXT:                    "label": "max",
+// CHECK-NEXT:                    "type": "Swift.Int",
+// CHECK-NEXT:                    "valueKind": "RawLiteral",
+// CHECK-NEXT:                    "value": "255"
+// CHECK-NEXT:                  }
+// CHECK-NEXT:                ]
+// CHECK-NEXT:              }
+// CHECK-NEXT:            }
+// CHECK-NEXT:          ]
+// CHECK-NEXT:        },
+// CHECK-NEXT:        "propertyWrappers": [
 // CHECK-NEXT:          {
 // CHECK-NEXT:            "type": "ExtractLiterals.Buffered",
+// CHECK-NEXT:            "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
+// CHECK-NEXT:            "line": 44,
 // CHECK-NEXT:            "arguments": []
 // CHECK-NEXT:          },
 // CHECK-NEXT:          {
 // CHECK-NEXT:            "type": "ExtractLiterals.Clamping",
+// CHECK-NEXT:            "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
+// CHECK-NEXT:            "line": 44,
 // CHECK-NEXT:            "arguments": [
 // CHECK-NEXT:              {
 // CHECK-NEXT:                "label": "min",
@@ -355,12 +585,90 @@ public struct PropertyWrappers : MyProto {
 // CHECK-NEXT:      },
 // CHECK-NEXT:      {
 // CHECK-NEXT:        "label": "$propertyWrapper3",
-// CHECK-NEXT:        "type": "(ExtractLiterals.Clamping<Swift.Int>, ExtractLiterals.Clamping<Swift.Int>?)",
+// CHECK-NEXT:        "type": "(ExtractLiterals.Clamping<Swift.Int>, Swift.Optional<ExtractLiterals.Clamping<Swift.Int>>)",
+// CHECK-NEXT:        "mangledTypeName": "n/a - deprecated",
 // CHECK-NEXT:        "isStatic": "false",
 // CHECK-NEXT:        "isComputed": "true",
 // CHECK-NEXT:        "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
 // CHECK-NEXT:        "line": 45,
 // CHECK-NEXT:        "valueKind": "Runtime"
+// CHECK-NEXT:      },
+// CHECK-NEXT:      {
+// CHECK-NEXT:        "label": "propertyWrapper4",
+// CHECK-NEXT:        "type": "Swift.String",
+// CHECK-NEXT:        "mangledTypeName": "n/a - deprecated",
+// CHECK-NEXT:        "isStatic": "false",
+// CHECK-NEXT:        "isComputed": "true",
+// CHECK-NEXT:        "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
+// CHECK-NEXT:        "line": 48,
+// CHECK-NEXT:        "valueKind": "Runtime",
+// CHECK-NEXT:        "propertyWrappers": [
+// CHECK-NEXT:          {
+// CHECK-NEXT:            "type": "ExtractLiterals.Buffered",
+// CHECK-NEXT:            "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
+// CHECK-NEXT:            "line": 47,
+// CHECK-NEXT:            "arguments": []
+// CHECK-NEXT:          }
+// CHECK-NEXT:        ]
+// CHECK-NEXT:      },
+// CHECK-NEXT:      {
+// CHECK-NEXT:        "label": "$propertyWrapper4",
+// CHECK-NEXT:        "type": "(Swift.String, Swift.Optional<Swift.String>)",
+// CHECK-NEXT:        "mangledTypeName": "n/a - deprecated",
+// CHECK-NEXT:        "isStatic": "false",
+// CHECK-NEXT:        "isComputed": "true",
+// CHECK-NEXT:        "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
+// CHECK-NEXT:        "line": 48,
+// CHECK-NEXT:        "valueKind": "Runtime"
+// CHECK-NEXT:      } 
+// CHECK-NEXT:    ]
+// CHECK-NEXT:  },
+// CHECK-NEXT:  {
+// CHECK-NEXT:    "typeName": "ExtractLiterals.Optionals",
+// CHECK-NEXT:    "mangledTypeName": "15ExtractLiterals9OptionalsV",
+// CHECK-NEXT:    "kind": "struct",
+// CHECK-NEXT:    "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
+// CHECK-NEXT:    "line": 97,
+// CHECK-NEXT:    "conformances": [
+// CHECK-NEXT:      "ExtractLiterals.MyProto"
+// CHECK-NEXT:    ],
+// CHECK-NEXT:    "allConformances": [
+// CHECK-NEXT:      {
+// CHECK-NEXT:        "protocolName": "ExtractLiterals.MyProto",
+// CHECK-NEXT:        "conformanceDefiningModule": "ExtractLiterals"
+// CHECK-NEXT:      }
+// CHECK-NEXT:    ],
+// CHECK-NEXT:    "associatedTypeAliases": [],
+// CHECK-NEXT:    "properties": [
+// CHECK-NEXT:      {
+// CHECK-NEXT:        "label": "int1",
+// CHECK-NEXT:        "type": "Swift.Optional<Swift.Bool>",
+// CHECK-NEXT:        "mangledTypeName": "n/a - deprecated",
+// CHECK-NEXT:        "isStatic": "false",
+// CHECK-NEXT:        "isComputed": "false",
+// CHECK-NEXT:        "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
+// CHECK-NEXT:        "line": 98,
+// CHECK-NEXT:        "valueKind": "NilLiteral"
+// CHECK-NEXT:      },
+// CHECK-NEXT:      {
+// CHECK-NEXT:        "label": "string1",
+// CHECK-NEXT:        "type": "Swift.Optional<Swift.String>",
+// CHECK-NEXT:        "mangledTypeName": "n/a - deprecated",
+// CHECK-NEXT:        "isStatic": "false",
+// CHECK-NEXT:        "isComputed": "false",
+// CHECK-NEXT:        "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
+// CHECK-NEXT:        "line": 99,
+// CHECK-NEXT:        "valueKind": "Runtime"
+// CHECK-NEXT:      },
+// CHECK-NEXT:      {
+// CHECK-NEXT:        "label": "float1",
+// CHECK-NEXT:        "type": "Swift.Optional<Swift.Float>",
+// CHECK-NEXT:        "mangledTypeName": "n/a - deprecated",
+// CHECK-NEXT:        "isStatic": "true",
+// CHECK-NEXT:        "isComputed": "false",
+// CHECK-NEXT:        "file": "{{.*}}test{{/|\\\\}}ConstExtraction{{/|\\\\}}ExtractLiterals.swift",
+// CHECK-NEXT:       "line": 100,
+// CHECK-NEXT:        "valueKind": "NilLiteral"
 // CHECK-NEXT:      }
 // CHECK-NEXT:    ]
 // CHECK-NEXT:  }

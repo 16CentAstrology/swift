@@ -344,7 +344,7 @@
 ///     } else {
 ///         print("No glyphs found!")
 ///     }
-///     // Prints "The 'star' image is a glyph.")
+///     // Prints "The 'star' image is a glyph."
 ///
 /// Note that in this example, `imagePaths` is subscripted using a dictionary
 /// index. Unlike the key-based subscript, the index-based subscript returns
@@ -386,6 +386,7 @@
 /// optimization that is used when two instances of `Dictionary` share
 /// buffer.
 @frozen
+@_eagerMove
 public struct Dictionary<Key: Hashable, Value> {
   /// The element type of a dictionary: a tuple containing an individual
   /// key-value pair.
@@ -485,10 +486,20 @@ public struct Dictionary<Key: Hashable, Value> {
     // error instead of calling fatalError() directly because we want the
     // message to include the duplicate key, and the closure only has access to
     // the conflicting values.
+    #if !$Embedded
     try! native.merge(
       keysAndValues,
       isUnique: true,
       uniquingKeysWith: { _, _ in throw _MergeError.keyCollision })
+    #else
+    native.merge(
+      keysAndValues,
+      isUnique: true,
+      uniquingKeysWith: { _, _ throws(_MergeError) in
+        throw _MergeError.keyCollision
+      }
+    )
+    #endif
     self.init(_native: native)
   }
 
@@ -821,7 +832,6 @@ extension Dictionary: ExpressibleByDictionaryLiteral {
   /// - Parameter elements: The key-value pairs that will make up the new
   ///   dictionary. Each key in `elements` must be unique.
   @inlinable
-  @_effects(readonly)
   @_semantics("optimize.sil.specialize.generic.size.never")
   public init(dictionaryLiteral elements: (Key, Value)...) {
     let native = _NativeDictionary<Key, Value>(capacity: elements.count)
@@ -1191,7 +1201,7 @@ extension Dictionary {
   ///     } else {
   ///         print("No value found for that key.")
   ///     }
-  ///     // Prints "No value found for that key.""
+  ///     // Prints "No value found for that key."
   ///
   /// - Parameter key: The key to remove along with its associated value.
   /// - Returns: The value that was removed, or `nil` if the key was not
@@ -1284,9 +1294,7 @@ extension Dictionary {
 
   /// A view of a dictionary's keys.
   @frozen
-  public struct Keys
-    : Collection, Equatable,
-      CustomStringConvertible, CustomDebugStringConvertible {
+  public struct Keys: Collection, Equatable {
     public typealias Element = Key
     public typealias SubSequence = Slice<Dictionary.Keys>
 
@@ -1399,20 +1407,11 @@ extension Dictionary {
 
       return true
     }
-
-    public var description: String {
-      return _makeCollectionDescription()
-    }
-
-    public var debugDescription: String {
-      return _makeCollectionDescription(withTypeName: "Dictionary.Keys")
-    }
   }
 
   /// A view of a dictionary's values.
   @frozen
-  public struct Values
-    : MutableCollection, CustomStringConvertible, CustomDebugStringConvertible {
+  public struct Values: MutableCollection {
     public typealias Element = Value
 
     @usableFromInline
@@ -1482,14 +1481,6 @@ extension Dictionary {
       return count == 0
     }
 
-    public var description: String {
-      return _makeCollectionDescription()
-    }
-
-    public var debugDescription: String {
-      return _makeCollectionDescription(withTypeName: "Dictionary.Values")
-    }
-
     @inlinable
     public mutating func swapAt(_ i: Index, _ j: Index) {
       guard i != j else { return }
@@ -1504,6 +1495,30 @@ extension Dictionary {
       let b = native.validatedBucket(for: j)
       _variant.asNative.swapValuesAt(a, b, isUnique: isUnique)
     }
+  }
+}
+
+@_unavailableInEmbedded
+extension Dictionary.Keys
+  : CustomStringConvertible, CustomDebugStringConvertible {
+  public var description: String {
+    return _makeCollectionDescription()
+  }
+
+  public var debugDescription: String {
+    return _makeCollectionDescription(withTypeName: "Dictionary.Keys")
+  }
+}
+
+@_unavailableInEmbedded
+extension Dictionary.Values
+  : CustomStringConvertible, CustomDebugStringConvertible {
+  public var description: String {
+    return _makeCollectionDescription()
+  }
+
+  public var debugDescription: String {
+    return _makeCollectionDescription(withTypeName: "Dictionary.Values")
   }
 }
 
@@ -1614,6 +1629,7 @@ extension Dictionary: Hashable where Value: Hashable {
   }
 }
 
+@_unavailableInEmbedded
 extension Dictionary: _HasCustomAnyHashableRepresentation
 where Value: Hashable {
   public __consuming func _toCustomAnyHashable() -> AnyHashable? {
@@ -1621,6 +1637,7 @@ where Value: Hashable {
   }
 }
 
+@_unavailableInEmbedded
 internal struct _DictionaryAnyHashableBox<Key: Hashable, Value: Hashable>
   : _AnyHashableBox {
   internal let _value: Dictionary<Key, Value>
@@ -1673,6 +1690,7 @@ internal struct _DictionaryAnyHashableBox<Key: Hashable, Value: Hashable>
   }
 }
 
+@_unavailableInEmbedded
 extension Collection {
   // Utility method for KV collections that wish to implement
   // CustomStringConvertible and CustomDebugStringConvertible using a bracketed
@@ -1694,9 +1712,15 @@ extension Collection {
       } else {
         result += ", "
       }
+      #if !$Embedded
       debugPrint(k, terminator: "", to: &result)
       result += ": "
       debugPrint(v, terminator: "", to: &result)
+      #else
+      "(cannot print value in embedded Swift)".write(to: &result)
+      result += ": "
+      "(cannot print value in embedded Swift)".write(to: &result)
+      #endif
     }
     result += "]"
     return result
@@ -1706,6 +1730,7 @@ extension Collection {
   }
 }
 
+@_unavailableInEmbedded
 extension Dictionary: CustomStringConvertible, CustomDebugStringConvertible {
   /// A string that represents the contents of the dictionary.
   public var description: String {
@@ -1779,6 +1804,8 @@ extension Dictionary {
 #endif
   }
 }
+
+extension Dictionary.Index._Variant: @unchecked Sendable {}
 
 extension Dictionary.Index {
 #if _runtime(_ObjC)
@@ -1958,6 +1985,9 @@ extension Dictionary {
   }
 }
 
+extension Dictionary.Iterator._Variant: @unchecked Sendable
+  where Key: Sendable, Value: Sendable {}
+
 extension Dictionary.Iterator {
 #if _runtime(_ObjC)
   @usableFromInline @_transparent
@@ -2110,16 +2140,16 @@ public typealias DictionaryIterator<Key: Hashable, Value> =
   Dictionary<Key, Value>.Iterator
 
 extension Dictionary: @unchecked Sendable
-  where Key: Sendable, Value: Sendable { }
+  where Key: Sendable, Value: Sendable {}
 extension Dictionary.Keys: @unchecked Sendable
-  where Key: Sendable, Value: Sendable { }
+  where Key: Sendable, Value: Sendable {}
 extension Dictionary.Values: @unchecked Sendable
-  where Key: Sendable, Value: Sendable { }
+  where Key: Sendable, Value: Sendable {}
 extension Dictionary.Keys.Iterator: @unchecked Sendable
-  where Key: Sendable, Value: Sendable { }
+  where Key: Sendable, Value: Sendable {}
 extension Dictionary.Values.Iterator: @unchecked Sendable
-  where Key: Sendable, Value: Sendable { }
+  where Key: Sendable, Value: Sendable {}
 extension Dictionary.Index: @unchecked Sendable
-  where Key: Sendable, Value: Sendable { }
+  where Key: Sendable, Value: Sendable {}
 extension Dictionary.Iterator: @unchecked Sendable
-  where Key: Sendable, Value: Sendable { }
+  where Key: Sendable, Value: Sendable {}

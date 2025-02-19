@@ -8,10 +8,28 @@
 
 swift_compiler_sources(Optimizer
   AssumeSingleThreaded.swift
+  AsyncDemotion.swift
+  BooleanLiteralFolding.swift
+  CleanupDebugSteps.swift
+  ClosureSpecialization.swift
   ComputeEscapeEffects.swift
   ComputeSideEffects.swift
+  CopyToBorrowOptimization.swift
+  DeadStoreElimination.swift
+  DeinitDevirtualizer.swift
+  DestroyHoisting.swift
+  InitializeStaticGlobals.swift
+  LetPropertyLowering.swift
+  LifetimeDependenceDiagnostics.swift
+  LifetimeDependenceInsertion.swift
+  LifetimeDependenceScopeFixup.swift
+  ObjectOutliner.swift
   ObjCBridgingOptimization.swift
   MergeCondFails.swift
+  NamedReturnValueOptimization.swift
+  RedundantLoadElimination.swift
   ReleaseDevirtualizer.swift
+  SimplificationPasses.swift
   StackPromotion.swift
+  StripObjectHeaders.swift
 )

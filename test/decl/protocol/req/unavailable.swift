@@ -19,14 +19,14 @@ protocol NonObjCProto {
   func good()
 }
 
-class Bar : NonObjCProto { // expected-error {{type 'Bar' does not conform to protocol 'NonObjCProto'}}
+class Bar : NonObjCProto { // expected-error {{type 'Bar' does not conform to protocol 'NonObjCProto'}} expected-note {{add stubs for conformance}}
   func good() {}
 }
 
 
 // Complain about unavailable witnesses (error in Swift 4, warning in Swift 3)
 protocol P {
-  func foo(bar: Foo) // expected-note 2 {{requirement 'foo(bar:)' declared here}}
+  func foo(bar: Foo) // expected-note 3 {{requirement 'foo(bar:)' declared here}}
 }
 
 struct ConformsToP : P { // expected-error{{type 'ConformsToP' does not conform to protocol 'P'}}
@@ -41,6 +41,44 @@ struct ConformsToP2 {
 extension ConformsToP2: P {} // expected-error{{type 'ConformsToP2' does not conform to protocol 'P'}}
 // expected-error@-1 {{unavailable instance method 'foo(bar:)' was used to satisfy a requirement of protocol 'P'}}
 
+@available(*, unavailable)
+struct ConformsToP3: P {
+  func foo(bar: Foo) { }
+}
+
+// Ok, an unavailable decl should be allowed to witness a requirement when the
+// conforming type is itself unavailable.
+@available(*, unavailable)
+struct ConformsToP4: P {
+  @available(*, unavailable)
+  func foo(bar: Foo) { }
+}
+
+struct ConformsToP5 {}
+
+// Ok, an unavailable decl should be allowed to witness a requirement when the
+// conformance extension is itself unavailable.
+@available(*, unavailable)
+extension ConformsToP5: P {
+  @available(*, unavailable)
+  func foo(bar: Foo) { }
+}
+
+struct ConformsToP6: P {} // expected-error{{type 'ConformsToP6' does not conform to protocol 'P'}}
+// expected-error@-1 {{unavailable instance method 'foo(bar:)' was used to satisfy a requirement of protocol 'P'}}
+
+@available(*, unavailable)
+extension ConformsToP6 {
+  func foo(bar: Foo) { } // expected-note {{'foo(bar:)' declared here}}
+}
+
+@available(*, unavailable)
+enum UnavailableEnum {
+  struct ConformsToP6: P {
+    @available(*, unavailable)
+    func foo(bar: Foo) { }
+  }
+}
 
 // Include message string from @available attribute if provided
 protocol Unavail {
@@ -60,4 +98,21 @@ struct NonSelfT: Unavail {
 struct SelfT: Unavail { // expected-error {{type 'SelfT' does not conform to protocol 'Unavail'}}
   // expected-error@-1 {{unavailable instance method 'req()' was used to satisfy a requirement of protocol 'Unavail': write it yourself}}
   typealias T = SelfT
+}
+
+protocol UnavailableAssoc {
+  @available(*, unavailable) // expected-error {{associated type cannot be marked unavailable with '@available'}}
+  associatedtype A1
+
+  @available(swift, introduced: 4)
+  associatedtype A2
+
+  @available(swift, introduced: 99) // expected-error {{associated type cannot be marked unavailable with '@available'}}
+  associatedtype A3
+
+  @available(swift, obsoleted: 4) // expected-error {{associated type cannot be marked unavailable with '@available'}}
+  associatedtype A4
+
+  @available(swift, obsoleted: 99)
+  associatedtype A5
 }

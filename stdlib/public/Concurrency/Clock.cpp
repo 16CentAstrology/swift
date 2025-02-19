@@ -11,16 +11,17 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/Runtime/Concurrency.h"
+#include "swift/Runtime/Once.h"
 
-#if __has_include(<time.h>)
-#define HAS_TIME 1
 #include <time.h>
-#endif
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <Windows.h>
+#include <realtimeapiset.h>
 #endif
+
+#include "Error.h"
 
 using namespace swift;
 
@@ -32,80 +33,60 @@ void swift_get_time(
   swift_clock_id clock_id) {
   switch (clock_id) {
     case swift_clock_id_continuous: {
-#if defined(__linux__) && HAS_TIME
       struct timespec continuous;
+#if defined(__linux__)
       clock_gettime(CLOCK_BOOTTIME, &continuous);
-      *seconds = continuous.tv_sec;
-      *nanoseconds = continuous.tv_nsec;
-#elif defined(__APPLE__) && HAS_TIME
-      struct timespec continuous;
+#elif defined(__APPLE__)
       clock_gettime(CLOCK_MONOTONIC_RAW, &continuous);
-      *seconds = continuous.tv_sec;
-      *nanoseconds = continuous.tv_nsec;
-#elif (defined(__OpenBSD__) || defined(__FreeBSD__) || defined(__wasi__)) && HAS_TIME
-      struct timespec continuous;
+#elif (defined(__OpenBSD__) || defined(__FreeBSD__) || defined(__wasi__))
       clock_gettime(CLOCK_MONOTONIC, &continuous);
-      *seconds = continuous.tv_sec;
-      *nanoseconds = continuous.tv_nsec;
 #elif defined(_WIN32)
-      LARGE_INTEGER freq;
-      QueryPerformanceFrequency(&freq);
-      LARGE_INTEGER count;
-      QueryPerformanceCounter(&count);
-      *seconds = count.QuadPart / freq.QuadPart;
-      if (freq.QuadPart < 1000000000) {
-        *nanoseconds = 
-            ((count.QuadPart % freq.QuadPart) * 1000000000) / freq.QuadPart;
-      } else {
-        *nanoseconds = 
-            (count.QuadPart % freq.QuadPart) * (1000000000.0 / freq.QuadPart);
-      }
+      // This needs to match what swift-corelibs-libdispatch does
+
+      // QueryInterruptTimePrecise() outputs a value measured in 100ns
+      // units. We must divide the output by 10,000,000 to get a value in
+      // seconds and multiply the remainder by 100 to get nanoseconds.
+      ULONGLONG interruptTime;
+      (void)QueryInterruptTimePrecise(&interruptTime);
+      continuous.tv_sec = interruptTime / 10'000'000;
+      continuous.tv_nsec = (interruptTime % 10'000'000) * 100;
 #else
 #error Missing platform continuous time definition
 #endif
+      *seconds = continuous.tv_sec;
+      *nanoseconds = continuous.tv_nsec;
       return;
     }
     case swift_clock_id_suspending: {
-#if defined(__linux__) && HAS_TIME
       struct timespec suspending;
+#if defined(__linux__)
       clock_gettime(CLOCK_MONOTONIC, &suspending);
-      *seconds = suspending.tv_sec;
-      *nanoseconds = suspending.tv_nsec;
-#elif defined(__APPLE__) && HAS_TIME
-      struct timespec suspending;
+#elif defined(__APPLE__)
       clock_gettime(CLOCK_UPTIME_RAW, &suspending);
-      *seconds = suspending.tv_sec;
-      *nanoseconds = suspending.tv_nsec;
-#elif defined(__wasi__) && HAS_TIME
-      struct timespec suspending;
+#elif defined(__wasi__)
       clock_gettime(CLOCK_MONOTONIC, &suspending);
-      *seconds = suspending.tv_sec;
-      *nanoseconds = suspending.tv_nsec;
-#elif (defined(__OpenBSD__) || defined(__FreeBSD__)) && HAS_TIME
-      struct timespec suspending;
+#elif (defined(__OpenBSD__) || defined(__FreeBSD__))
       clock_gettime(CLOCK_UPTIME, &suspending);
-      *seconds = suspending.tv_sec;
-      *nanoseconds = suspending.tv_nsec;
 #elif defined(_WIN32)
-      LARGE_INTEGER freq;
-      QueryPerformanceFrequency(&freq);
-      LARGE_INTEGER count;
-      QueryPerformanceCounter(&count);
-      *seconds = count.QuadPart / freq.QuadPart;
-      if (freq.QuadPart < 1000000000) {
-        *nanoseconds = 
-            ((count.QuadPart % freq.QuadPart) * 1000000000) / freq.QuadPart;
-      } else {
-        *nanoseconds = 
-            (count.QuadPart % freq.QuadPart) * (1000000000.0 / freq.QuadPart);
-      }
+      // This needs to match what swift-corelibs-libdispatch does
+
+      // QueryUnbiasedInterruptTimePrecise() outputs a value measured in 100ns
+      // units. We must divide the output by 10,000,000 to get a value in
+      // seconds and multiply the remainder by 100 to get nanoseconds.
+      ULONGLONG unbiasedTime;
+      (void)QueryUnbiasedInterruptTimePrecise(&unbiasedTime);
+      suspending.tv_sec = unbiasedTime / 10'000'000;
+      suspending.tv_nsec = (unbiasedTime % 10'000'000) * 100;
 #else
 #error Missing platform suspending time definition
 #endif
+      *seconds = suspending.tv_sec;
+      *nanoseconds = suspending.tv_nsec;
       return;
     }
   }
-  abort(); // Invalid clock_id
+  swift_Concurrency_fatalError(0, "Fatal error: invalid clock ID %d\n",
+                               clock_id);
 }
 
 SWIFT_EXPORT_FROM(swift_Concurrency)
@@ -116,55 +97,44 @@ void swift_get_clock_res(
   swift_clock_id clock_id) {
 switch (clock_id) {
     case swift_clock_id_continuous: {
-#if defined(__linux__) && HAS_TIME
       struct timespec continuous;
+#if defined(__linux__)
       clock_getres(CLOCK_BOOTTIME, &continuous);
-      *seconds = continuous.tv_sec;
-      *nanoseconds = continuous.tv_nsec;
-#elif defined(__APPLE__) && HAS_TIME
-      struct timespec continuous;
+#elif defined(__APPLE__)
       clock_getres(CLOCK_MONOTONIC_RAW, &continuous);
-      *seconds = continuous.tv_sec;
-      *nanoseconds = continuous.tv_nsec;
-#elif (defined(__OpenBSD__) || defined(__FreeBSD__) || defined(__wasi__)) && HAS_TIME
-      struct timespec continuous;
+#elif (defined(__OpenBSD__) || defined(__FreeBSD__) || defined(__wasi__))
       clock_getres(CLOCK_MONOTONIC, &continuous);
-      *seconds = continuous.tv_sec;
-      *nanoseconds = continuous.tv_nsec;
 #elif defined(_WIN32)
-      *seconds = 0;
-      *nanoseconds = 1000;
+      continuous.tv_sec = 0;
+      continuous.tv_nsec = 100;
 #else
 #error Missing platform continuous time definition
 #endif
+      *seconds = continuous.tv_sec;
+      *nanoseconds = continuous.tv_nsec;
       return;
     }
     case swift_clock_id_suspending: {
       struct timespec suspending;
-#if defined(__linux__) && HAS_TIME
+#if defined(__linux__)
       clock_getres(CLOCK_MONOTONIC_RAW, &suspending);
-      *seconds = suspending.tv_sec;
-      *nanoseconds = suspending.tv_nsec;
-#elif defined(__APPLE__) && HAS_TIME
+#elif defined(__APPLE__)
       clock_getres(CLOCK_UPTIME_RAW, &suspending);
-      *seconds = suspending.tv_sec;
-      *nanoseconds = suspending.tv_nsec;
-#elif defined(__wasi__) && HAS_TIME
+#elif defined(__wasi__)
       clock_getres(CLOCK_MONOTONIC, &suspending);
-      *seconds = suspending.tv_sec;
-      *nanoseconds = suspending.tv_nsec;
-#elif (defined(__OpenBSD__) || defined(__FreeBSD__)) && HAS_TIME
+#elif (defined(__OpenBSD__) || defined(__FreeBSD__))
       clock_getres(CLOCK_UPTIME, &suspending);
-      *seconds = suspending.tv_sec;
-      *nanoseconds = suspending.tv_nsec;
 #elif defined(_WIN32)
-      *seconds = 0;
-      *nanoseconds = 1000;
+      suspending.tv_sec = 0;
+      suspending.tv_nsec = 100;
 #else
 #error Missing platform suspending time definition
 #endif
+      *seconds = suspending.tv_sec;
+      *nanoseconds = suspending.tv_nsec;
       return;
     }
   }
-  abort(); // Invalid clock_id
+  swift_Concurrency_fatalError(0, "Fatal error: invalid clock ID %d\n",
+                               clock_id);
 }

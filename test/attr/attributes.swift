@@ -68,7 +68,7 @@ protocol ProtoWithTransparent {
 class TestTranspClass : ProtoWithTransparent {
   @_transparent  // expected-error{{'@_transparent' attribute is not supported on declarations within classes}} {{3-17=}}
   init () {}
-  @_transparent // expected-error{{'@_transparent' attribute cannot be applied to this declaration}} {{3-17=}}
+  @_transparent // expected-error{{'@_transparent' attribute is not supported on declarations within classes}} {{3-17=}}
   deinit {}
   @_transparent // expected-error{{'@_transparent' attribute is not supported on declarations within classes}} {{3-17=}}
   class func transStatic() {}
@@ -191,6 +191,12 @@ weak var weak16 : Class!
 
 @weak var weak17 : Class? // expected-error {{'weak' is a declaration modifier, not an attribute}} {{1-2=}}
 
+class SomeClass {}
+protocol SomeProtocol {}
+_ = {
+  // Make sure the fix-it here includes the parens
+  weak var x: SomeClass & SomeProtocol // expected-error {{'weak' variable should have optional type '(any SomeClass & SomeProtocol)?'}} {{15-15=(}} {{39-39=)?}}
+}
 
 @_exported var exportVar: Int // expected-error {{@_exported may only be used on 'import' declarations}}{{1-12=}}
 @_exported func exportFunc() {} // expected-error {{@_exported may only be used on 'import' declarations}}{{1-12=}}
@@ -210,9 +216,9 @@ func func_with_unknown_attr3(x: @unknown(Int) -> Int) {} // expected-error {{unk
 func func_with_unknown_attr4(x: @unknown(Int) throws -> Int) {} // expected-error {{unknown attribute 'unknown'}}
 func func_with_unknown_attr5(x: @unknown (x: Int, y: Int)) {} // expected-error {{unknown attribute 'unknown'}}
 func func_with_unknown_attr6(x: @unknown(x: Int, y: Int)) {} // expected-error {{unknown attribute 'unknown'}}
-func func_with_unknown_attr7(x: @unknown (Int) () -> Int) {} // expected-error {{unknown attribute 'unknown'}}
+func func_with_unknown_attr7(x: @unknown (Int) () -> Int) {} // expected-error {{unknown attribute 'unknown'}} expected-warning {{extraneous whitespace between attribute name and '('; this is an error in the Swift 6 language mode}}
 
-func func_type_attribute_with_space(x: @convention (c) () -> Int) {} // OK. Known attributes can have space before its paren.
+func func_type_attribute_with_space(x: @convention(c) () -> Int) {} // OK. Known attributes can have space before its paren.
 
 // @thin and @pseudogeneric are not supported except in SIL.
 var thinFunc : @thin () -> () // expected-error {{unknown attribute 'thin'}}
@@ -348,3 +354,21 @@ enum E1 {
 }
 
 @_custom func testCustomAttribute() {} // expected-error {{unknown attribute '_custom'}}
+
+// https://github.com/apple/swift/issues/65705
+struct GI65705<A> {}
+struct I65705 {
+  let m1: @discardableResult () -> Int // expected-error {{attribute can only be applied to declarations, not types}} {{11-30=}} {{none}}
+  var m2: @discardableResult () -> Int // expected-error {{attribute can only be applied to declarations, not types}} {{11-30=}} {{none}}
+  let m3: GI65705<@discardableResult () -> Int> // expected-error{{attribute can only be applied to declarations, not types}} {{19-37=}} {{none}}
+
+  func f1(_: inout @discardableResult Int) {} // expected-error {{attribute can only be applied to declarations, not types}} {{20-39=}} {{3-3=@discardableResult }} {{none}}
+  func f2(_: @discardableResult Int) {} // expected-error {{attribute can only be applied to declarations, not types}} {{14-33=}} {{3-3=@discardableResult }} {{none}}
+
+  func stmt(_ a: Int?) {
+    if let _: @discardableResult Int = a { // expected-error {{attribute can only be applied to declarations, not types}} {{15-34=}} 
+    }
+    if var _: @discardableResult Int = a { // expected-error {{attribute can only be applied to declarations, not types}} {{15-34=}}
+    }
+  }
+}

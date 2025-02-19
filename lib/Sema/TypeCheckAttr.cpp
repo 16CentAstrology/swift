@@ -18,15 +18,19 @@
 #include "TypeCheckAvailability.h"
 #include "TypeCheckConcurrency.h"
 #include "TypeCheckDistributed.h"
+#include "TypeCheckMacros.h"
 #include "TypeCheckObjC.h"
 #include "TypeCheckType.h"
 #include "TypeChecker.h"
 #include "swift/AST/ASTVisitor.h"
+#include "swift/AST/AvailabilityInference.h"
 #include "swift/AST/ClangModuleLoader.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/DiagnosticsParse.h"
 #include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/Effects.h"
+#include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/ImportCache.h"
 #include "swift/AST/ModuleNameLookup.h"
@@ -39,13 +43,15 @@
 #include "swift/AST/SwiftNameTranslation.h"
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Parse/Lexer.h"
-#include "swift/Parse/Parser.h"
+#include "swift/Parse/ParseDeclName.h"
 #include "swift/Sema/IDETypeChecking.h"
 #include "clang/Basic/CharInfo.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
+#include <optional>
 
 using namespace swift;
 
@@ -106,6 +112,27 @@ public:
     return true;
   }
 
+  void diagnoseIsolatedDeinitInValueTypes(DeclAttribute *attr) {
+    auto &C = D->getASTContext();
+
+    if (isa<DestructorDecl>(D)) {
+      if (auto nominal = dyn_cast<NominalTypeDecl>(D->getDeclContext())) {
+        if (!isa<ClassDecl>(nominal)) {
+          // only classes and actors can have isolated deinit.
+          diagnoseAndRemoveAttr(attr, diag::isolated_deinit_on_value_type);
+          return;
+        }
+      }
+
+      TypeChecker::checkAvailability(
+        attr->getRange(), C.getIsolatedDeinitAvailability(),
+        D->getDeclContext(),
+        [&](StringRef platformName, llvm::VersionTuple version) {
+          return diagnoseAndRemoveAttr(attr, diag::isolated_deinit_unavailable, platformName, version);
+        });
+    }
+  }
+
   template <typename... ArgTypes>
   InFlightDiagnostic diagnose(ArgTypes &&... Args) const {
     return Ctx.Diags.diagnose(std::forward<ArgTypes>(Args)...);
@@ -136,13 +163,14 @@ public:
   IGNORED_ATTR(Semantics)
   IGNORED_ATTR(NoLocks)
   IGNORED_ATTR(NoAllocation)
+  IGNORED_ATTR(NoRuntime)
+  IGNORED_ATTR(NoExistentials)
+  IGNORED_ATTR(NoObjCBridging)
   IGNORED_ATTR(EmitAssemblyVisionRemarks)
   IGNORED_ATTR(ShowInInterface)
-  IGNORED_ATTR(SILGenName)
   IGNORED_ATTR(StaticInitializeObjCMetadata)
   IGNORED_ATTR(SynthesizedProtocol)
   IGNORED_ATTR(Testable)
-  IGNORED_ATTR(WeakLinked)
   IGNORED_ATTR(PrivateImport)
   IGNORED_ATTR(DisfavoredOverload)
   IGNORED_ATTR(ProjectedValueProperty)
@@ -155,14 +183,212 @@ public:
   IGNORED_ATTR(AtReasync)
   IGNORED_ATTR(ImplicitSelfCapture)
   IGNORED_ATTR(InheritActorContext)
-  IGNORED_ATTR(Isolated)
   IGNORED_ATTR(Preconcurrency)
-  IGNORED_ATTR(BackDeploy)
+  IGNORED_ATTR(BackDeployed)
   IGNORED_ATTR(Documentation)
-  IGNORED_ATTR(Expression)
-  IGNORED_ATTR(Declaration)
-  IGNORED_ATTR(Attached)
+  IGNORED_ATTR(LexicalLifetimes)
+  IGNORED_ATTR(AllowFeatureSuppression)
+  IGNORED_ATTR(PreInverseGenerics)
 #undef IGNORED_ATTR
+
+private:
+  static unsigned getABIArity(AbstractFunctionDecl *afd) {
+    unsigned arity = afd->getParameters()->size();
+    arity += afd->getGenericSignature().getGenericParams().size();
+    if (afd->hasImplicitSelfDecl())
+      arity += 1;
+    return arity;
+  }
+
+  void checkABIAttrPBD(PatternBindingDecl *APBD, VarDecl *VD) {
+    auto PBD = VD->getParentPatternBinding();
+
+    // To make sure we only diagnose this stuff once, check that VD is the first
+    // anchoring variable in the PBD.
+    bool isFirstAnchor = false;
+    for (auto i : range(PBD->getNumPatternEntries())) {
+      auto anchorVD = PBD->getAnchoringVarDecl(i);
+      if (anchorVD) {
+        isFirstAnchor = (anchorVD == VD);
+        break;
+      }
+    }
+
+    if (!isFirstAnchor)
+      return;
+
+    // Check that the PBDs have the same number of patterns.
+    if (PBD->getNumPatternEntries() < APBD->getNumPatternEntries()) {
+      diagnose(APBD->getPattern(PBD->getNumPatternEntries())->getLoc(),
+               diag::attr_abi_mismatched_pbd_size, /*abiHasExtra=*/false);
+      return;
+    }
+    if (PBD->getNumPatternEntries() > APBD->getNumPatternEntries()) {
+      diagnose(PBD->getPattern(APBD->getNumPatternEntries())->getLoc(),
+               diag::attr_abi_mismatched_pbd_size, /*abiHasExtra=*/true);
+      return;
+    }
+
+    // Check that each pattern has the same number of variables.
+    for (auto i : range(PBD->getNumPatternEntries())) {
+      SmallVector<VarDecl *, 8> VDs;
+      SmallVector<VarDecl *, 8> AVDs;
+
+      PBD->getPattern(i)->collectVariables(VDs);
+      APBD->getPattern(i)->collectVariables(AVDs);
+
+      if (VDs.size() < AVDs.size()) {
+        for (auto AVD : drop_begin(AVDs, VDs.size())) {
+          AVD->diagnose(diag::attr_abi_mismatched_var,
+                        AVD, /*isABI=*/true);
+        }
+      }
+      else if (VDs.size() > AVDs.size()) {
+        for (auto VD : drop_begin(VDs, AVDs.size())) {
+          VD->diagnose(diag::attr_abi_mismatched_var,
+                       VD, /*isABI=*/false);
+        }
+      }
+    }
+  }
+
+public:
+  void visitExecutionAttr(ExecutionAttr *attr) {
+    auto *F = dyn_cast<FuncDecl>(D);
+    if (!F)
+      return;
+
+    if (!F->hasAsync()) {
+      diagnoseAndRemoveAttr(attr, diag::attr_execution_only_on_async, F);
+      return;
+    }
+
+    switch (attr->getBehavior()) {
+    case ExecutionKind::Concurrent: {
+      // 'concurrent' doesn't work with explicit `nonisolated`
+      if (F->hasExplicitIsolationAttribute()) {
+        if (F->getAttrs().hasAttribute<NonisolatedAttr>()) {
+          diagnoseAndRemoveAttr(
+              attr,
+              diag::attr_execution_concurrent_incompatible_with_nonisolated, F);
+          return;
+        }
+      }
+
+      auto parameters = F->getParameters();
+      if (!parameters)
+        return;
+
+      for (auto *P : *parameters) {
+        auto *repr = P->getTypeRepr();
+        if (!repr)
+          continue;
+
+        // isolated parameters affect isolation of the function itself
+        if (isa<IsolatedTypeRepr>(repr)) {
+          diagnoseAndRemoveAttr(
+              attr,
+              diag::attr_execution_concurrent_incompatible_isolated_parameter,
+              F, P);
+          return;
+        }
+
+        if (auto *attrType = dyn_cast<AttributedTypeRepr>(repr)) {
+          if (attrType->has(TypeAttrKind::Isolated)) {
+            diagnoseAndRemoveAttr(
+                attr,
+                diag::
+                    attr_execution_concurrent_incompatible_dynamically_isolated_parameter,
+                F, P);
+            return;
+          }
+        }
+      }
+
+      break;
+    }
+
+    case ExecutionKind::Caller: {
+      // no restrictions for now.
+      break;
+    }
+    }
+  }
+
+  void visitABIAttr(ABIAttr *attr) {
+    Decl *AD = attr->abiDecl;
+    if (isa<VarDecl>(D) && isa<PatternBindingDecl>(AD)) {
+      auto VD = cast<VarDecl>(D);
+      auto APBD = cast<PatternBindingDecl>(AD);
+
+      // Diagnose dissimilar PBD structures.
+      checkABIAttrPBD(APBD, VD);
+
+      // Do the rest of this checking on the corresponding VarDecl, not the
+      // PBD that's actually in the attribute. Note that `AD` will become null
+      // if they're too dissimilar to match up.
+      AD = APBD->getVarAtSimilarStructuralPosition(VD);
+    }
+    // TODO: EnumElementDecl?
+
+    if (!AD)
+      return;
+
+    // Check the ABI decl and bail if there was a problem with it.
+    TypeChecker::typeCheckDecl(AD);
+    if (AD->isInvalid())
+      return;
+
+    // Do the declarations have the same kind, broadly speaking? Many kinds have
+    // special mangling behavior (e.g. inits vs normal funcs) that make it
+    // unrealistic to treat one kind as though it were another.
+    if (D->getKind() != AD->getKind()) {
+      // FIXME: DescriptiveDeclKind is overly specific; we really just want to
+      //        say that e.g. a `func` can't have the ABI of a `var`.
+      diagnoseAndRemoveAttr(attr, diag::attr_abi_mismatched_kind,
+                            D, AD->getDescriptiveKind());
+      return;
+    }
+
+    if (isa<AbstractFunctionDecl>(D)) {
+      auto AFD = cast<AbstractFunctionDecl>(D);
+      auto AAFD = cast<AbstractFunctionDecl>(AD);
+
+      // FIXME: How much should we diagnose in IRGen for more precise ABI info?
+
+      // Do the declarations have roughly the same number of parameters? We'll
+      // allow some fuzziness for what these parameters *are*, since there isn't
+      // always an ABI difference between e.g. a free function with N parameters
+      // and an instance method with N-1 parameters (plus an implicit `self`).
+      if (getABIArity(AFD) != getABIArity(AAFD)) {
+        diagnoseAndRemoveAttr(attr, diag::attr_abi_mismatched_arity,
+                              AFD);
+      }
+
+      // Do the declarations match in throwing behavior? We don't care about
+      // `throws` vs. `rethrows` here, just whether callers will account for an
+      // error return.
+      // FIXME: Typed throws?
+      if (AFD->hasThrows() != AAFD->hasThrows()) {
+        diagnoseAndRemoveAttr(attr, diag::attr_abi_mismatched_throws,
+                              AFD, /*abiCanThrow=*/AAFD->hasThrows());
+      }
+
+      // Do the declarations match in async-ness?
+      if (AFD->hasAsync() != AAFD->hasAsync()) {
+        diagnoseAndRemoveAttr(attr, diag::attr_abi_mismatched_async,
+                              AFD, /*abiHasAsync=*/AAFD->hasAsync());
+      }
+    }
+
+    // TODO: Diagnose if Protocol::isMarkerProtocol() - contradiction in terms
+    //       (and mangler can't handle invertible protocols with @abi)
+
+    // TODO: Validate more
+    // FIXME: The list of properties that have to match is practically endless
+    // and will grow as new features are added to the compiler. We might want to
+    // write an AttributeVisitor just to help us catch omissions over time.
+  }
 
   void visitAlignmentAttr(AlignmentAttr *attr) {
     // Alignment must be a power of two.
@@ -200,7 +426,11 @@ public:
   void visitMutationAttr(DeclAttribute *attr);
   void visitMutatingAttr(MutatingAttr *attr) { visitMutationAttr(attr); }
   void visitNonMutatingAttr(NonMutatingAttr *attr) { visitMutationAttr(attr); }
+  void visitBorrowingAttr(BorrowingAttr *attr) { visitMutationAttr(attr); }
   void visitConsumingAttr(ConsumingAttr *attr) { visitMutationAttr(attr); }
+  void visitLegacyConsumingAttr(LegacyConsumingAttr *attr) {
+    visitMutationAttr(attr);
+  }
   void visitDynamicAttr(DynamicAttr *attr);
 
   void visitIndirectAttr(IndirectAttr *attr) {
@@ -252,6 +482,9 @@ public:
 
   void visitCDeclAttr(CDeclAttr *attr);
   void visitExposeAttr(ExposeAttr *attr);
+  void visitExternAttr(ExternAttr *attr);
+  void visitUsedAttr(UsedAttr *attr);
+  void visitSectionAttr(SectionAttr *attr);
 
   void visitDynamicCallableAttr(DynamicCallableAttr *attr);
 
@@ -291,6 +524,7 @@ public:
   void visitDiscardableResultAttr(DiscardableResultAttr *attr);
   void visitDynamicReplacementAttr(DynamicReplacementAttr *attr);
   void visitTypeEraserAttr(TypeEraserAttr *attr);
+  void visitStorageRestrictionsAttr(StorageRestrictionsAttr *attr);
   void visitImplementsAttr(ImplementsAttr *attr);
   void visitNoMetadataAttr(NoMetadataAttr *attr);
 
@@ -298,8 +532,6 @@ public:
 
   void visitCustomAttr(CustomAttr *attr);
   void visitPropertyWrapperAttr(PropertyWrapperAttr *attr);
-  void visitTypeWrapperAttr(TypeWrapperAttr *attr);
-  void visitTypeWrapperIgnoredAttr(TypeWrapperIgnoredAttr *attr);
   void visitResultBuilderAttr(ResultBuilderAttr *attr);
 
   void visitImplementationOnlyAttr(ImplementationOnlyAttr *attr);
@@ -319,29 +551,48 @@ public:
 
   void visitReasyncAttr(ReasyncAttr *attr);
   void visitNonisolatedAttr(NonisolatedAttr *attr);
+  void visitIsolatedAttr(IsolatedAttr *attr);
 
   void visitNoImplicitCopyAttr(NoImplicitCopyAttr *attr);
   
   void visitAlwaysEmitConformanceMetadataAttr(AlwaysEmitConformanceMetadataAttr *attr);
 
+  void visitExtractConstantsFromMembersAttr(ExtractConstantsFromMembersAttr *attr);
+
+  void visitSensitiveAttr(SensitiveAttr *attr);
+
   void visitUnavailableFromAsyncAttr(UnavailableFromAsyncAttr *attr);
 
   void visitUnsafeInheritExecutorAttr(UnsafeInheritExecutorAttr *attr);
 
-  bool visitLifetimeAttr(DeclAttribute *attr);
+  bool visitOwnershipAttr(DeclAttribute *attr);
   void visitEagerMoveAttr(EagerMoveAttr *attr);
   void visitNoEagerMoveAttr(NoEagerMoveAttr *attr);
 
   void visitCompilerInitializedAttr(CompilerInitializedAttr *attr);
 
   void checkAvailableAttrs(ArrayRef<AvailableAttr *> Attrs);
-  void checkBackDeployAttrs(ArrayRef<BackDeployAttr *> Attrs);
+  void checkBackDeployedAttrs(ArrayRef<BackDeployedAttr *> Attrs);
 
   void visitKnownToBeLocalAttr(KnownToBeLocalAttr *attr);
 
   void visitSendableAttr(SendableAttr *attr);
 
-  void visitRuntimeMetadataAttr(RuntimeMetadataAttr *attr);
+  void visitMacroRoleAttr(MacroRoleAttr *attr);
+  
+  void visitRawLayoutAttr(RawLayoutAttr *attr);
+
+  void visitNonEscapableAttr(NonEscapableAttr *attr);
+  void visitUnsafeNonEscapableResultAttr(UnsafeNonEscapableResultAttr *attr);
+
+  void visitStaticExclusiveOnlyAttr(StaticExclusiveOnlyAttr *attr);
+  void visitWeakLinkedAttr(WeakLinkedAttr *attr);
+  void visitSILGenNameAttr(SILGenNameAttr *attr);
+  void visitUnsafeAttr(UnsafeAttr *attr);
+  void visitSafeAttr(SafeAttr *attr);
+  void visitLifetimeAttr(LifetimeAttr *attr);
+  void visitAddressableSelfAttr(AddressableSelfAttr *attr);
+  void visitAddressableForDependenciesAttr(AddressableForDependenciesAttr *attr);
 };
 
 } // end anonymous namespace
@@ -349,7 +600,7 @@ public:
 void AttributeChecker::visitNoImplicitCopyAttr(NoImplicitCopyAttr *attr) {
   // Only allow for this attribute to be used when experimental move only is
   // enabled.
-  if (!D->getASTContext().LangOpts.hasFeature(Feature::MoveOnly)) {
+  if (!D->getASTContext().LangOpts.hasFeature(Feature::NoImplicitCopy)) {
     auto error =
         diag::experimental_moveonly_feature_can_only_be_used_when_enabled;
     diagnoseAndRemoveAttr(attr, error);
@@ -357,7 +608,7 @@ void AttributeChecker::visitNoImplicitCopyAttr(NoImplicitCopyAttr *attr) {
   }
 
   if (auto *funcDecl = dyn_cast<FuncDecl>(D)) {
-    if (visitLifetimeAttr(attr))
+    if (visitOwnershipAttr(attr))
       return;
 
     // We only handle non-lvalue arguments today.
@@ -417,6 +668,20 @@ void AttributeChecker::visitAlwaysEmitConformanceMetadataAttr(AlwaysEmitConforma
   return;
 }
 
+void AttributeChecker::visitExtractConstantsFromMembersAttr(ExtractConstantsFromMembersAttr *attr) {
+  if (!Ctx.LangOpts.hasFeature(Feature::ExtractConstantsFromMembers)) {
+    diagnoseAndRemoveAttr(attr,
+                          diag::attr_extractConstantsFromMembers_experimental);
+  }
+}
+
+void AttributeChecker::visitSensitiveAttr(SensitiveAttr *attr) {
+  if (!Ctx.LangOpts.hasFeature(Feature::Sensitive)) {
+    diagnoseAndRemoveAttr(attr,
+                          diag::attr_sensitive_experimental);
+  }
+}
+
 void AttributeChecker::visitTransparentAttr(TransparentAttr *attr) {
   DeclContext *dc = D->getDeclContext();
   // Protocol declarations cannot be transparent.
@@ -445,14 +710,20 @@ void AttributeChecker::visitMutationAttr(DeclAttribute *attr) {
 
   SelfAccessKind attrModifier;
   switch (attr->getKind()) {
-  case DeclAttrKind::DAK_Consuming:
-    attrModifier = SelfAccessKind::Consuming;
+  case DeclAttrKind::LegacyConsuming:
+    attrModifier = SelfAccessKind::LegacyConsuming;
     break;
-  case DeclAttrKind::DAK_Mutating:
+  case DeclAttrKind::Mutating:
     attrModifier = SelfAccessKind::Mutating;
     break;
-  case DeclAttrKind::DAK_NonMutating:
+  case DeclAttrKind::NonMutating:
     attrModifier = SelfAccessKind::NonMutating;
+    break;
+  case DeclAttrKind::Consuming:
+    attrModifier = SelfAccessKind::Consuming;
+    break;
+  case DeclAttrKind::Borrowing:
+    attrModifier = SelfAccessKind::Borrowing;
     break;
   default:
     llvm_unreachable("unhandled attribute kind");
@@ -464,10 +735,29 @@ void AttributeChecker::visitMutationAttr(DeclAttribute *attr) {
     // 'mutating' and 'nonmutating' are not valid on types
     // with reference semantics.
     if (contextTy->hasReferenceSemantics()) {
-      if (attrModifier != SelfAccessKind::Consuming) {
+      switch (attrModifier) {
+      case SelfAccessKind::Consuming:
+      case SelfAccessKind::LegacyConsuming:
+      case SelfAccessKind::Borrowing:
+        // It's still OK to specify the ownership convention of methods in
+        // classes.
+        break;
+        
+      case SelfAccessKind::Mutating:
+      case SelfAccessKind::NonMutating:
         diagnoseAndRemoveAttr(attr, diag::mutating_invalid_classes,
                               attrModifier, FD->getDescriptiveKind(),
                               DC->getSelfProtocolDecl() != nullptr);
+        break;
+      }
+    }
+
+    // Types who are marked @_staticExclusiveOnly cannot have mutating functions.
+    if (auto SD = contextTy->getStructOrBoundGenericStruct()) {
+      if (SD->getAttrs().hasAttribute<StaticExclusiveOnlyAttr>() &&
+          attrModifier == SelfAccessKind::Mutating) {
+        diagnoseAndRemoveAttr(attr, diag::attr_static_exclusive_only_mutating,
+                              contextTy, FD);
       }
     }
   } else {
@@ -475,11 +765,12 @@ void AttributeChecker::visitMutationAttr(DeclAttribute *attr) {
                           attrModifier);
   }
 
-  // Verify we don't have more than one of mutating, nonmutating,
-  // and __consuming.
+  // Verify we don't have more than one ownership specifier.
   if ((FD->getAttrs().hasAttribute<MutatingAttr>() +
-          FD->getAttrs().hasAttribute<NonMutatingAttr>() +
-          FD->getAttrs().hasAttribute<ConsumingAttr>()) > 1) {
+       FD->getAttrs().hasAttribute<NonMutatingAttr>() +
+       FD->getAttrs().hasAttribute<LegacyConsumingAttr>() +
+       FD->getAttrs().hasAttribute<ConsumingAttr>() +
+       FD->getAttrs().hasAttribute<BorrowingAttr>()) > 1) {
     if (auto *NMA = FD->getAttrs().getAttribute<NonMutatingAttr>()) {
       if (attrModifier != SelfAccessKind::NonMutating) {
         diagnoseAndRemoveAttr(NMA, diag::functions_mutating_and_not,
@@ -494,14 +785,27 @@ void AttributeChecker::visitMutationAttr(DeclAttribute *attr) {
       }
     }
 
+    if (auto *CSA = FD->getAttrs().getAttribute<LegacyConsumingAttr>()) {
+      if (attrModifier != SelfAccessKind::LegacyConsuming) {
+        diagnoseAndRemoveAttr(CSA, diag::functions_mutating_and_not,
+                              SelfAccessKind::LegacyConsuming, attrModifier);
+      }
+    }
+
     if (auto *CSA = FD->getAttrs().getAttribute<ConsumingAttr>()) {
       if (attrModifier != SelfAccessKind::Consuming) {
         diagnoseAndRemoveAttr(CSA, diag::functions_mutating_and_not,
                               SelfAccessKind::Consuming, attrModifier);
       }
     }
-  }
 
+    if (auto *BSA = FD->getAttrs().getAttribute<BorrowingAttr>()) {
+      if (attrModifier != SelfAccessKind::Borrowing) {
+        diagnoseAndRemoveAttr(BSA, diag::functions_mutating_and_not,
+                              SelfAccessKind::Borrowing, attrModifier);
+      }
+    }
+  }
   // Verify that we don't have a static function.
   if (FD->isStatic())
     diagnoseAndRemoveAttr(attr, diag::static_functions_not_mutating);
@@ -548,7 +852,7 @@ static void emitFixItIBActionRemoveAsync(ASTContext &ctx, const FuncDecl &FD) {
     SourceLoc endLoc =
         returnType.isValid() ? returnType.getEnd() : FD.getAsyncLoc();
     ctx.Diags
-        .diagnose(FD.getAsyncLoc(), diag::remove_async_add_task, FD.getName())
+        .diagnose(FD.getAsyncLoc(), diag::remove_async_add_task, &FD)
         .fixItReplace(
             SourceRange(FD.getSourceRangeIncludingAttrs().Start, endLoc),
             replacement);
@@ -576,7 +880,7 @@ static void emitFixItIBActionRemoveAsync(ASTContext &ctx, const FuncDecl &FD) {
   replacement += " }\n}";
 
   ctx.Diags
-      .diagnose(FD.getAsyncLoc(), diag::remove_async_add_task, FD.getName())
+      .diagnose(FD.getAsyncLoc(), diag::remove_async_add_task, &FD)
       .fixItReplace(SourceRange(FD.getSourceRangeIncludingAttrs().Start,
                                 FD.getBody()->getRBraceLoc()),
                     replacement);
@@ -632,6 +936,9 @@ static bool iswatchOS(ASTContext &ctx) {
 }
 
 static bool isRelaxedIBAction(ASTContext &ctx) {
+  if (ctx.LangOpts.Target.isXROS())
+    return true;
+
   return isiOS(ctx) || iswatchOS(ctx);
 }
 
@@ -758,23 +1065,23 @@ void AttributeChecker::visitGKInspectableAttr(GKInspectableAttr *attr) {
                           attr->getAttrName());
 }
 
-static Optional<Diag<bool,Type>>
+static std::optional<Diag<bool, Type>>
 isAcceptableOutletType(Type type, bool &isArray, ASTContext &ctx) {
   if (type->isObjCExistentialType() || type->isAny())
-    return None; // @objc existential types are okay
+    return std::nullopt; // @objc existential types are okay
 
   auto nominal = type->getAnyNominal();
 
   if (auto classDecl = dyn_cast_or_null<ClassDecl>(nominal)) {
     if (classDecl->isObjC())
-      return None; // @objc class types are okay.
+      return std::nullopt; // @objc class types are okay.
     return diag::iboutlet_nonobjc_class;
   }
 
   if (type->isString()) {
     // String is okay because it is bridged to NSString.
     // FIXME: BridgesTypes.def is almost sufficient for this.
-    return None;
+    return std::nullopt;
   }
 
   if (type->isArray()) {
@@ -799,7 +1106,6 @@ isAcceptableOutletType(Type type, bool &isArray, ASTContext &ctx) {
   return diag::iboutlet_nonobject_type;
 }
 
-
 void AttributeChecker::visitIBOutletAttr(IBOutletAttr *attr) {
   // Only instance properties can be 'IBOutlet'.
   auto *VD = cast<VarDecl>(D);
@@ -816,7 +1122,7 @@ void AttributeChecker::visitIBOutletAttr(IBOutletAttr *attr) {
   }
 
   // Verify that the field type is valid as an outlet.
-  auto type = VD->getType();
+  auto type = VD->getTypeInContext();
 
   if (VD->isInvalid())
     return;
@@ -934,8 +1240,9 @@ void AttributeChecker::visitLazyAttr(LazyAttr *attr) {
 
 bool AttributeChecker::visitAbstractAccessControlAttr(
     AbstractAccessControlAttr *attr) {
-  // Access control attr may only be used on value decls and extensions.
-  if (!isa<ValueDecl>(D) && !isa<ExtensionDecl>(D)) {
+  // Access control attr may only be used on value decls, extensions and
+  // imports.
+  if (!isa<ValueDecl>(D) && !isa<ExtensionDecl>(D) && !isa<ImportDecl>(D)) {
     diagnoseAndRemoveAttr(attr, diag::invalid_decl_modifier, attr);
     return true;
   }
@@ -958,6 +1265,38 @@ bool AttributeChecker::visitAbstractAccessControlAttr(
   if (isa<ProtocolDecl>(D->getDeclContext())) {
     diagnoseAndRemoveAttr(attr, diag::access_control_in_protocol, attr);
     diagnose(attr->getLocation(), diag::access_control_in_protocol_detail);
+    return true;
+  }
+
+  SourceFile *File = D->getDeclContext()->getParentSourceFile();
+  if (isa<ImportDecl>(D)) {
+    if (attr->getAccess() == AccessLevel::Open) {
+      diagnoseAndRemoveAttr(attr, diag::access_level_on_import_unsupported,
+                            attr);
+      return true;
+    }
+
+    if (attr->getAccess() != AccessLevel::Public) {
+      if (auto exportedAttr = D->getAttrs().getAttribute<ExportedAttr>()) {
+        diagnoseAndRemoveAttr(attr, diag::access_level_conflict_with_exported,
+                              exportedAttr, attr);
+        return true;
+      }
+    }
+  }
+
+  if (attr->getAccess() == AccessLevel::Package &&
+      D->getASTContext().LangOpts.PackageName.empty() &&
+      File && File->Kind != SourceFileKind::Interface) {
+    // `package` modifier used outside of a package.
+    // Error if a source file contains a package decl or `package import` but
+    // no package-name is passed.
+    // Note that if the file containing the package decl is a public (or private)
+    // interface file, the decl must be @usableFromInline (or "inlinable"),
+    // effectively getting "public" visibility; in such case, package-name is
+    // not needed, and typecheck on those decls are skipped.
+    diagnose(attr->getLocation(), diag::access_control_requires_package_name,
+             isa<ValueDecl>(D), D);
     return true;
   }
 
@@ -1050,9 +1389,9 @@ void AttributeChecker::visitAccessControlAttr(AccessControlAttr *attr) {
           // an extension.
           if (!VD->isObjC() && attr->getAccess() == AccessLevel::Open) {
             diagnose(attr->getLocation(),
-                     diag::access_control_non_objc_open_member,
-                     VD->getDescriptiveKind())
-                .fixItReplace(attr->getRange(), "public");
+                     diag::access_control_non_objc_open_member, VD)
+                .fixItReplace(attr->getRange(), "public")
+                .warnUntilSwiftVersion(7);
           }
         }
       }
@@ -1135,8 +1474,17 @@ void AttributeChecker::visitSPIAccessControlAttr(SPIAccessControlAttr *attr) {
     // VD must be public or open to use an @_spi attribute.
     auto declAccess = VD->getFormalAccess();
     auto DC = VD->getDeclContext()->getAsDecl();
-    if (declAccess < AccessLevel::Public &&
-        !VD->getAttrs().hasAttribute<UsableFromInlineAttr>() &&
+
+    AbstractStorageDecl *storage = nullptr;
+    if (auto *AD = dyn_cast<AccessorDecl>(VD))
+      storage = AD->getStorage();
+
+    auto canUseAttr = [](ValueDecl *VD) {
+      return VD->getFormalAccess() >= AccessLevel::Public ||
+        VD->getAttrs().hasAttribute<UsableFromInlineAttr>();
+    };
+    if (!canUseAttr(VD) &&
+        !(storage && canUseAttr(storage)) &&
         !(DC && DC->isSPI())) {
       diagnoseAndRemoveAttr(attr,
                             diag::spi_attribute_on_non_public,
@@ -1150,18 +1498,18 @@ void AttributeChecker::visitSPIAccessControlAttr(SPIAccessControlAttr *attr) {
         if (property->isLayoutExposedToClients() && !NTD->isSPI()) {
           diagnoseAndRemoveAttr(attr,
                                 diag::spi_attribute_on_frozen_stored_properties,
-                                VD->getName());
+                                VD);
         }
       }
     }
 
     // Forbid enum elements marked SPI in frozen types.
-    if (auto elt = dyn_cast<EnumElementDecl>(VD)) {
+    if (isa<EnumElementDecl>(VD)) {
       if (auto ED = dyn_cast<EnumDecl>(D->getDeclContext())) {
         if (ED->getAttrs().hasAttribute<FrozenAttr>(/*allowInvalid*/ true) &&
             !ED->isSPI()) {
           diagnoseAndRemoveAttr(attr, diag::spi_attribute_on_frozen_enum_case,
-                                VD->getDescriptiveKind(), VD->getName());
+                                VD);
         }
       }
     }
@@ -1172,7 +1520,7 @@ void AttributeChecker::visitSPIAccessControlAttr(SPIAccessControlAttr *attr) {
     if (importedModule) {
       auto path = importedModule->getModuleFilename();
       if (llvm::sys::path::extension(path) == ".swiftinterface" &&
-          !path.endswith(".private.swiftinterface")) {
+          !(path.ends_with(".private.swiftinterface") || path.ends_with(".package.swiftinterface"))) {
         // If the module was built from the public swiftinterface, it can't
         // have any SPI.
         diagnose(attr->getLocation(),
@@ -1196,8 +1544,8 @@ static bool checkObjCDeclContext(Decl *D) {
 static void diagnoseObjCAttrWithoutFoundation(DeclAttribute *attr, Decl *decl,
                                               ObjCReason reason,
                                               DiagnosticBehavior behavior) {
-  assert(attr->getKind() == DeclAttrKind::DAK_ObjC ||
-         attr->getKind() == DeclAttrKind::DAK_ObjCMembers);
+  assert(attr->getKind() == DeclAttrKind::ObjC ||
+         attr->getKind() == DeclAttrKind::ObjCMembers);
   auto *SF = decl->getDeclContext()->getParentSourceFile();
   assert(SF);
 
@@ -1244,10 +1592,13 @@ void AttributeChecker::visitObjCAttr(ObjCAttr *attr) {
   auto behavior = behaviorLimitForObjCReason(reason, Ctx);
 
   // Only certain decls can be ObjC.
-  Optional<Diag<>> error;
-  if (isa<ClassDecl>(D) ||
-      isa<ProtocolDecl>(D)) {
+  std::optional<Diag<>> error;
+  if (isa<ClassDecl>(D)) {
     /* ok */
+  } else if (auto *P = dyn_cast<ProtocolDecl>(D)) {
+    if (P->isMarkerProtocol())
+      error = diag::invalid_objc_decl;
+    /* ok on non-marker protocols */
   } else if (auto Ext = dyn_cast<ExtensionDecl>(D)) {
     if (!Ext->getSelfClassDecl())
       error = diag::objc_extension_not_class;
@@ -1264,8 +1615,13 @@ void AttributeChecker::visitObjCAttr(ObjCAttr *attr) {
     if (!checkObjCDeclContext(D))
       error = diag::invalid_objc_decl_context;
     else if (auto accessor = dyn_cast<AccessorDecl>(func))
-      if (!accessor->isGetterOrSetter())
-        error = diag::objc_observing_accessor;
+      if (!accessor->isGetterOrSetter()) {
+        auto declKind = accessor->getDescriptiveKind();
+        diagnoseAndRemoveAttr(attr, diag::objc_observing_accessor, declKind)
+            .limitBehavior(behavior);
+        reason.describe(D);
+        return;
+      }
   } else if (isa<ConstructorDecl>(D) ||
              isa<DestructorDecl>(D) ||
              isa<SubscriptDecl>(D) ||
@@ -1324,6 +1680,12 @@ void AttributeChecker::visitObjCAttr(ObjCAttr *attr) {
                                     attr->getLParenLoc(), firstNameLoc,
                                     objcName->getSelectorPieces()[0],
                                     attr->getRParenLoc()));
+      } else if (auto Ext = dyn_cast<ExtensionDecl>(D)) {
+        assert(Ext->getSelfClassDecl());
+        // This is an extension with an explicit, and otherwise valid, category
+        // name. Schedule it to be checked for name conflicts later.
+        if (auto *SF = Ext->getParentSourceFile())
+          SF->ObjCCategories.push_back(Ext);
       }
     } else if (isa<SubscriptDecl>(D) || isa<DestructorDecl>(D)) {
       SourceLoc diagLoc = attr->getLParenLoc();
@@ -1414,50 +1776,181 @@ void AttributeChecker::visitNonObjCAttr(NonObjCAttr *attr) {
   }
 }
 
+static bool hasObjCImplementationFeature(Decl *D, ObjCImplementationAttr *attr,
+                                         Feature requiredFeature) {
+  auto &ctx = D->getASTContext();
+
+  if (ctx.LangOpts.hasFeature(requiredFeature))
+    return true;
+
+  // Allow the use of @_objcImplementation *without* Feature::ObjCImplementation
+  // as long as you're using the early adopter syntax. (Avoids breaking existing
+  // adopters.)
+  if (requiredFeature == Feature::ObjCImplementation && attr->isEarlyAdopter())
+    return true;
+
+  // Either you're using Feature::ObjCImplementation without the early adopter
+  // syntax, or you're using Feature::CImplementation. Either way, no go.
+  ctx.Diags.diagnose(attr->getLocation(), diag::requires_experimental_feature,
+                     attr->getAttrName(), attr->isDeclModifier(),
+                     getFeatureName(requiredFeature));
+  return false;
+}
+
+static SourceRange getArgListRange(ASTContext &Ctx, DeclAttribute *attr) {
+  // attr->getRange() covers the attr name and argument list; adjust it to
+  // exclude the first token.
+  auto newStart = Lexer::getLocForEndOfToken(Ctx.SourceMgr,
+                                             attr->getRange().Start);
+  if (attr->getRange().contains(newStart)) {
+    return SourceRange(newStart, attr->getRange().End);
+  }
+  return SourceRange();
+}
+
 void AttributeChecker::
 visitObjCImplementationAttr(ObjCImplementationAttr *attr) {
-  auto ED = cast<ExtensionDecl>(D);
-  if (ED->isConstrainedExtension())
-    diagnoseAndRemoveAttr(attr,
-                          diag::attr_objc_implementation_must_be_unconditional);
+  DeclAttribute * langAttr =
+    D->getAttrs().getAttribute<ObjCAttr>(/*AllowInvalid=*/true);
+  if (!langAttr)
+    langAttr = D->getAttrs().getAttribute<CDeclAttr>(/*AllowInvalid=*/true);
 
-  auto CD = dyn_cast<ClassDecl>(ED->getExtendedNominal());
-  if (!CD) {
-    diagnoseAndRemoveAttr(attr,
-                          diag::attr_objc_implementation_must_extend_class,
-                          ED->getExtendedNominal()->getDescriptiveKind(),
-                          ED->getExtendedNominal());
-    ED->getExtendedNominal()->diagnose(diag::decl_declared_here,
-                                       ED->getExtendedNominal()->getName());
-    return;
-  }
+  if (!langAttr) {
+    diagnose(attr->getLocation(), diag::attr_implementation_requires_language);
 
-  if (!CD->hasClangNode()) {
-    diagnoseAndRemoveAttr(attr, diag::attr_objc_implementation_must_be_imported,
-                          CD->getDescriptiveKind(), CD);
-    CD->diagnose(diag::decl_declared_here, CD->getName());
-    return;
-  }
+    // If this is an extension, suggest '@objc'.
+    if (auto ED = dyn_cast<ExtensionDecl>(D)) {
+      auto diag = diagnose(attr->getLocation(),
+                           diag::make_decl_objc_for_implementation,
+                           D->getDescriptiveKind());
 
-  if (!attr->isCategoryNameInvalid() && !ED->getImplementedObjCDecl()) {
-    diagnose(attr->getLocation(),
-             diag::attr_objc_implementation_category_not_found,
-             attr->CategoryName, CD);
-
-    // attr->getRange() covers the attr name and argument list; adjust it to
-    // exclude the first token.
-    auto newStart = Lexer::getLocForEndOfToken(Ctx.SourceMgr,
-                                               attr->getRange().Start);
-    if (attr->getRange().contains(newStart)) {
-      auto argListRange = SourceRange(newStart, attr->getRange().End);
-      diagnose(attr->getLocation(),
-               diag::attr_objc_implementation_fixit_remove_category_name)
-        .fixItRemove(argListRange);
+      ObjCSelector correctSelector(Ctx, 0, {attr->CategoryName});
+      fixDeclarationObjCName(diag, ED, ObjCSelector(), correctSelector);
     }
 
-    attr->setCategoryNameInvalid();
-
     return;
+  }
+
+  if (auto ED = dyn_cast<ExtensionDecl>(D)) {
+    if (!hasObjCImplementationFeature(D, attr, Feature::ObjCImplementation))
+      return;
+
+    auto objcLangAttr = dyn_cast<ObjCAttr>(langAttr);
+    assert(objcLangAttr && "extension with @_cdecl or another lang attr???");
+
+    // Only early adopters should specify the category name on the attribute;
+    // the stabilized syntax uses @objc(CustomName) for that.
+    if (!attr->isEarlyAdopter() && !attr->CategoryName.empty()) {
+      auto diag = diagnose(attr->getLocation(),
+                           diag::attr_implementation_category_goes_on_objc_attr);
+
+      ObjCSelector correctSelector(Ctx, 0, {attr->CategoryName});
+      auto argListRange = getArgListRange(Ctx, attr);
+      if (argListRange.isValid()) {
+        diag.fixItRemove(argListRange);
+        fixDeclarationObjCName(diag, ED,
+                               objcLangAttr->getName().value_or(ObjCSelector()),
+                               correctSelector);
+      }
+      objcLangAttr->setName(correctSelector, /*implicit=*/false);
+
+      attr->setCategoryNameInvalid();
+
+      return;
+    }
+
+    if (ED->isConstrainedExtension())
+      diagnoseAndRemoveAttr(attr,
+                            diag::attr_objc_implementation_must_be_unconditional);
+
+    auto CD = dyn_cast<ClassDecl>(ED->getExtendedNominal());
+    if (!CD) {
+      // This will be diagnosed as diag::objc_extension_not_class.
+      attr->setInvalid();
+      return;
+    }
+
+    if (!CD->hasClangNode()) {
+      diagnoseAndRemoveAttr(attr, diag::attr_objc_implementation_must_be_imported,
+                            CD);
+      CD->diagnose(diag::decl_declared_here, CD);
+      return;
+    }
+
+    if (!CD->hasSuperclass()) {
+      diagnoseAndRemoveAttr(attr,
+                            diag::attr_objc_implementation_must_have_super, CD);
+      CD->diagnose(diag::decl_declared_here, CD);
+      return;
+    }
+
+    if (CD->isTypeErasedGenericClass()) {
+      diagnoseAndRemoveAttr(attr,
+                            diag::objc_implementation_cannot_have_generics, CD);
+      CD->diagnose(diag::decl_declared_here, CD);
+      return;
+    }
+
+    if (!attr->isCategoryNameInvalid() && !ED->getImplementedObjCDecl()) {
+      diagnose(attr->getLocation(),
+               diag::attr_objc_implementation_category_not_found,
+               ED->getObjCCategoryName(), CD);
+
+      SourceRange argListRange;
+      if (attr->CategoryName.empty())
+        argListRange = getArgListRange(Ctx, langAttr);
+      else
+        argListRange = getArgListRange(Ctx, attr);
+      if (argListRange.isValid()) {
+        diagnose(attr->getLocation(),
+                 diag::attr_objc_implementation_fixit_remove_category_name)
+            .fixItRemove(argListRange);
+      }
+
+      attr->setInvalid();
+
+      return;
+    }
+
+    // While it's possible that @objc @implementation would function with
+    // pre-stable runtimes, this isn't a configuration that's been tested or
+    // supported.
+    auto deploymentAvailability = AvailabilityRange::forDeploymentTarget(Ctx);
+    if (!deploymentAvailability.isContainedIn(Ctx.getSwift50Availability())) {
+      auto diag = diagnose(
+          attr->getLocation(),
+          diag::attr_objc_implementation_raise_minimum_deployment_target,
+          Ctx.getTargetPlatformStringForDiagnostics(),
+          Ctx.getSwift50Availability().getRawMinimumVersion());
+      if (attr->isEarlyAdopter()) {
+        diag.wrapIn(diag::wrap_objc_implementation_will_become_error);
+      }
+    }
+  }
+  else if (auto AFD = dyn_cast<AbstractFunctionDecl>(D)) {
+    if (!hasObjCImplementationFeature(D, attr, Feature::CImplementation))
+      return;
+
+    if (!attr->CategoryName.empty()) {
+      auto diagnostic =
+          diagnose(attr->getLocation(),
+                   diag::attr_objc_implementation_no_category_for_func, AFD);
+
+      auto argListRange = getArgListRange(Ctx, attr);
+      if (argListRange.isValid()) {
+        diagnostic.fixItRemove(argListRange);
+      }
+
+      attr->setCategoryNameInvalid();
+    }
+
+    // FIXME: if (AFD->getCDeclName().empty())
+
+    if (!AFD->getImplementedObjCDecl()) {
+      diagnose(attr->getLocation(),
+               diag::attr_objc_implementation_func_not_found,
+               AFD->getCDeclName(), AFD);
+    }
   }
 }
 
@@ -1494,21 +1987,33 @@ void TypeChecker::checkDeclAttributes(Decl *D) {
 
   AttributeChecker Checker(D);
   // We need to check all availableAttrs, OriginallyDefinedInAttr and
-  // BackDeployAttr relative to each other, so collect them and check in
+  // BackDeployedAttr relative to each other, so collect them and check in
   // batch later.
   llvm::SmallVector<AvailableAttr *, 4> availableAttrs;
-  llvm::SmallVector<BackDeployAttr *, 4> backDeployAttrs;
+  llvm::SmallVector<BackDeployedAttr *, 4> backDeployedAttrs;
   llvm::SmallVector<OriginallyDefinedInAttr*, 4> ODIAttrs;
-  for (auto attr : D->getAttrs()) {
+  for (auto attr : D->getExpandedAttrs()) {
     if (!attr->isValid()) continue;
+
+    // If the attribute requires a feature that is not enabled, and it is not
+    // an implicit attribute, diagnose and disable it.
+    if (auto feature = DeclAttribute::getRequiredFeature(attr->getKind())) {
+      if (!attr->isImplicit()
+            && !D->getASTContext().LangOpts.hasFeature(*feature)) {
+        Checker.diagnoseAndRemoveAttr(attr, diag::requires_experimental_feature,
+                                      attr->getAttrName(), false,
+                                      getFeatureName(*feature));
+        continue;
+      }
+    }
 
     // If Attr.def says that the attribute cannot appear on this kind of
     // declaration, diagnose it and disable it.
     if (attr->canAppearOnDecl(D)) {
       if (auto *ODI = dyn_cast<OriginallyDefinedInAttr>(attr)) {
         ODIAttrs.push_back(ODI);
-      } else if (auto *BD = dyn_cast<BackDeployAttr>(attr)) {
-        backDeployAttrs.push_back(BD);
+      } else if (auto *BD = dyn_cast<BackDeployedAttr>(attr)) {
+        backDeployedAttrs.push_back(BD);
       } else {
         // check @available attribute both collectively and individually.
         if (auto *AV = dyn_cast<AvailableAttr>(attr)) {
@@ -1554,7 +2059,7 @@ void TypeChecker::checkDeclAttributes(Decl *D) {
       Checker.diagnoseAndRemoveAttr(attr, diag::invalid_decl_attribute, attr);
   }
   Checker.checkAvailableAttrs(availableAttrs);
-  Checker.checkBackDeployAttrs(backDeployAttrs);
+  Checker.checkBackDeployedAttrs(backDeployedAttrs);
   Checker.checkOriginalDefinedInAttrs(ODIAttrs);
 }
 
@@ -1562,9 +2067,9 @@ void TypeChecker::checkDeclAttributes(Decl *D) {
 /// @dynamicCallable attribute requirement. The method is given to be defined
 /// as one of the following: `dynamicallyCall(withArguments:)` or
 /// `dynamicallyCall(withKeywordArguments:)`.
-bool swift::isValidDynamicCallableMethod(FuncDecl *decl, ModuleDecl *module,
+bool swift::isValidDynamicCallableMethod(FuncDecl *decl,
                                          bool hasKeywordArguments) {
-  auto &ctx = module->getASTContext();
+  auto &ctx = decl->getASTContext();
   // There are two cases to check.
   // 1. `dynamicallyCall(withArguments:)`.
   //    In this case, the method is valid if the argument has type `A` where
@@ -1578,14 +2083,14 @@ bool swift::isValidDynamicCallableMethod(FuncDecl *decl, ModuleDecl *module,
 
   auto paramList = decl->getParameters();
   if (paramList->size() != 1 || paramList->get(0)->isVariadic()) return false;
-  auto argType = paramList->get(0)->getType();
+  auto argType = paramList->get(0)->getTypeInContext();
 
   // If non-keyword (positional) arguments, check that argument type conforms to
   // `ExpressibleByArrayLiteral`.
   if (!hasKeywordArguments) {
     auto arrayLitProto =
       ctx.getProtocol(KnownProtocolKind::ExpressibleByArrayLiteral);
-    return (bool)TypeChecker::conformsToProtocol(argType, arrayLitProto, module);
+    return (bool) checkConformance(argType, arrayLitProto);
   }
   // If keyword arguments, check that argument type conforms to
   // `ExpressibleByDictionaryLiteral` and that the `Key` associated type
@@ -1594,11 +2099,11 @@ bool swift::isValidDynamicCallableMethod(FuncDecl *decl, ModuleDecl *module,
     ctx.getProtocol(KnownProtocolKind::ExpressibleByStringLiteral);
   auto dictLitProto =
     ctx.getProtocol(KnownProtocolKind::ExpressibleByDictionaryLiteral);
-  auto dictConf = TypeChecker::conformsToProtocol(argType, dictLitProto, module);
+  auto dictConf = checkConformance(argType, dictLitProto);
   if (dictConf.isInvalid())
     return false;
   auto keyType = dictConf.getTypeWitnessByName(argType, ctx.Id_Key);
-  return (bool)TypeChecker::conformsToProtocol(keyType, stringLitProtocol, module);
+  return (bool) checkConformance(keyType, stringLitProtocol);
 }
 
 /// Returns true if the given nominal type has a valid implementation of a
@@ -1613,10 +2118,9 @@ static bool hasValidDynamicCallableMethod(NominalTypeDecl *decl,
   if (candidates.empty()) return false;
 
   // Filter valid candidates.
-  auto *module = decl->getParentModule();
   candidates.filter([&](LookupResultEntry entry, bool isOuter) {
     auto candidate = cast<FuncDecl>(entry.getValueDecl());
-    return isValidDynamicCallableMethod(candidate, module, hasKeywordArgs);
+    return isValidDynamicCallableMethod(candidate, hasKeywordArgs);
   });
 
   // If there are no valid candidates, return false.
@@ -1665,17 +2169,15 @@ static bool hasSingleNonVariadicParam(SubscriptDecl *decl,
 /// the `subscript(dynamicMember:)` requirement for @dynamicMemberLookup.
 /// The method is given to be defined as `subscript(dynamicMember:)`.
 bool swift::isValidDynamicMemberLookupSubscript(SubscriptDecl *decl,
-                                                ModuleDecl *module,
                                                 bool ignoreLabel) {
   // It could be
   // - `subscript(dynamicMember: {Writable}KeyPath<...>)`; or
   // - `subscript(dynamicMember: String*)`
   return isValidKeyPathDynamicMemberLookup(decl, ignoreLabel) ||
-         isValidStringDynamicMemberLookup(decl, module, ignoreLabel);
+         isValidStringDynamicMemberLookup(decl, ignoreLabel);
 }
 
 bool swift::isValidStringDynamicMemberLookup(SubscriptDecl *decl,
-                                             ModuleDecl *module,
                                              bool ignoreLabel) {
   auto &ctx = decl->getASTContext();
   // There are two requirements:
@@ -1686,24 +2188,58 @@ bool swift::isValidStringDynamicMemberLookup(SubscriptDecl *decl,
     return false;
 
   const auto *param = decl->getIndices()->get(0);
-  auto paramType = param->getType();
+  auto paramType = param->getTypeInContext();
 
   // If this is `subscript(dynamicMember: String*)`
   return TypeChecker::conformsToKnownProtocol(
-      paramType, KnownProtocolKind::ExpressibleByStringLiteral, module);
+      paramType, KnownProtocolKind::ExpressibleByStringLiteral);
+}
+
+BoundGenericType *
+swift::getKeyPathTypeForDynamicMemberLookup(SubscriptDecl *decl,
+                                            bool ignoreLabel) {
+  auto &ctx = decl->getASTContext();
+  if (!hasSingleNonVariadicParam(decl, ctx.Id_dynamicMember,
+                                 ignoreLabel))
+    return nullptr;
+
+  auto paramTy = decl->getIndices()->get(0)->getInterfaceType();
+
+  // Allow to compose key path type with a `Sendable` protocol as
+  // a way to express sendability requirement.
+  if (auto *existential = paramTy->getAs<ExistentialType>()) {
+    auto layout = existential->getExistentialLayout();
+
+    auto protocols = layout.getProtocols();
+    if (!llvm::all_of(protocols,
+                      [&](ProtocolDecl *proto) {
+                        if (proto->isSpecificProtocol(KnownProtocolKind::Sendable))
+                          return true;
+
+                        if (proto->getInvertibleProtocolKind())
+                          return true;
+
+                        return false;
+                      })) {
+      return nullptr;
+    }
+
+    paramTy = layout.getSuperclass();
+    if (!paramTy)
+      return nullptr;
+  }
+
+  if (!paramTy->isKeyPath() &&
+      !paramTy->isWritableKeyPath() &&
+      !paramTy->isReferenceWritableKeyPath()) {
+    return nullptr;
+  }
+  return paramTy->getAs<BoundGenericType>();
 }
 
 bool swift::isValidKeyPathDynamicMemberLookup(SubscriptDecl *decl,
                                               bool ignoreLabel) {
-  auto &ctx = decl->getASTContext();
-  if (!hasSingleNonVariadicParam(decl, ctx.Id_dynamicMember,
-                                 ignoreLabel))
-    return false;
-
-  auto paramTy = decl->getIndices()->get(0)->getInterfaceType();
-  return paramTy->isKeyPath() ||
-         paramTy->isWritableKeyPath() ||
-         paramTy->isReferenceWritableKeyPath();
+  return bool(getKeyPathTypeForDynamicMemberLookup(decl, ignoreLabel));
 }
 
 /// The @dynamicMemberLookup attribute is only allowed on types that have at
@@ -1721,8 +2257,6 @@ visitDynamicMemberLookupAttr(DynamicMemberLookupAttr *attr) {
   auto type = decl->getDeclaredType();
   auto &ctx = decl->getASTContext();
 
-  auto *module = decl->getParentModule();
-
   auto emitInvalidTypeDiagnostic = [&](const SourceLoc loc) {
     diagnose(loc, diag::invalid_dynamic_member_lookup_type, type);
     attr->setInvalid();
@@ -1738,7 +2272,7 @@ visitDynamicMemberLookupAttr(DynamicMemberLookupAttr *attr) {
     auto oneCandidate = candidates.front().getValueDecl();
     candidates.filter([&](LookupResultEntry entry, bool isOuter) -> bool {
       auto cand = cast<SubscriptDecl>(entry.getValueDecl());
-      return isValidDynamicMemberLookupSubscript(cand, module);
+      return isValidDynamicMemberLookupSubscript(cand);
     });
 
     if (candidates.empty()) {
@@ -1760,8 +2294,7 @@ visitDynamicMemberLookupAttr(DynamicMemberLookupAttr *attr) {
   // Validate the candidates while ignoring the label.
   newCandidates.filter([&](const LookupResultEntry entry, bool isOuter) {
     auto cand = cast<SubscriptDecl>(entry.getValueDecl());
-    return isValidDynamicMemberLookupSubscript(cand, module,
-                                               /*ignoreLabel*/ true);
+    return isValidDynamicMemberLookupSubscript(cand, /*ignoreLabel*/ true);
   });
 
   // If there were no potentially valid candidates, then throw an error.
@@ -1802,34 +2335,31 @@ static Decl *getEnclosingDeclForDecl(Decl *D) {
   return D->getDeclContext()->getInnermostDeclarationDeclContext();
 }
 
-void AttributeChecker::visitAvailableAttr(AvailableAttr *attr) {
+static std::optional<std::pair<SemanticAvailableAttr, const Decl *>>
+getSemanticAvailableRangeDeclAndAttr(const Decl *decl) {
+  if (auto attr = decl->getAvailableAttrForPlatformIntroduction(
+          /*checkExtension=*/false))
+    return std::make_pair(*attr, decl);
+
+  if (auto *parent =
+          AvailabilityInference::parentDeclForInferredAvailability(decl))
+    return getSemanticAvailableRangeDeclAndAttr(parent);
+
+  return std::nullopt;
+}
+
+void AttributeChecker::visitAvailableAttr(AvailableAttr *parsedAttr) {
   if (Ctx.LangOpts.DisableAvailabilityChecking)
     return;
 
-  while (attr->IsSPI) {
-    if (attr->hasPlatform() && attr->Introduced.has_value())
-      break;
-    diagnoseAndRemoveAttr(attr, diag::spi_available_malformed);
-    break;
-  }
+  auto attr = D->getSemanticAvailableAttr(parsedAttr);
+  if (!attr)
+    return;
 
-  if (auto *PD = dyn_cast<ProtocolDecl>(D->getDeclContext())) {
-    if (auto *VD = dyn_cast<ValueDecl>(D)) {
-      if (VD->isProtocolRequirement()) {
-        if (attr->isActivePlatform(Ctx) ||
-            attr->isLanguageVersionSpecific() ||
-            attr->isPackageDescriptionVersionSpecific()) {
-          auto versionAvailability = attr->getVersionAvailability(Ctx);
-          if (attr->isUnconditionallyUnavailable() ||
-              versionAvailability == AvailableVersionComparison::Obsoleted ||
-              versionAvailability == AvailableVersionComparison::Unavailable) {
-              if (!PD->isObjC()) {
-                diagnoseAndRemoveAttr(attr, diag::unavailable_method_non_objc_protocol);
-                return;
-              }
-            }
-          }
-        }
+  if (attr->isSPI()) {
+    if (!attr->isPlatformSpecific() || !attr->getIntroduced().has_value()) {
+      diagnoseAndRemoveAttr(parsedAttr, diag::spi_available_malformed);
+      return;
     }
   }
 
@@ -1846,7 +2376,7 @@ void AttributeChecker::visitAvailableAttr(AvailableAttr *attr) {
       if (const ValueDecl *vd = dyn_cast<ValueDecl>(D)) {
         D->getASTContext().Diags.diagnose(
             D->getLoc(), diag::async_named_decl_must_be_available_from_async,
-            D->getDescriptiveKind(), vd->getName());
+            vd);
       } else {
         D->getASTContext().Diags.diagnose(
             D->getLoc(), diag::async_decl_must_be_available_from_async,
@@ -1857,61 +2387,68 @@ void AttributeChecker::visitAvailableAttr(AvailableAttr *attr) {
     // deinit's may not be unavailable from async contexts
     if (isa<DestructorDecl>(D)) {
       D->getASTContext().Diags.diagnose(
-          D->getLoc(), diag::invalid_decl_attribute, attr);
+          D->getLoc(), diag::invalid_decl_attribute, parsedAttr);
     }
-
   }
 
-  if (!attr->hasPlatform() || !attr->isActivePlatform(Ctx) ||
-      !attr->Introduced.has_value()) {
+  // Skip the remaining diagnostics in swiftinterfaces.
+  auto *DC = D->getDeclContext();
+  if (DC->isInSwiftinterface())
     return;
-  }
+
+  // The remaining diagnostics are only for attributes that are active.
+  if (!attr->isActive(Ctx))
+    return;
 
   // Make sure there isn't a more specific attribute we should be using instead.
-  // findMostSpecificActivePlatform() is O(N), so only do this if we're checking
-  // an iOS attribute while building for macCatalyst.
-  if (attr->Platform == PlatformKind::iOS &&
+  // getActiveAvailableAttrForCurrentPlatform() is O(N), so only do this if
+  // we're checking an iOS attribute while building for macCatalyst.
+  if (attr->getPlatform() == PlatformKind::iOS &&
       isPlatformActive(PlatformKind::macCatalyst, Ctx.LangOpts)) {
-    if (attr != D->getAttrs().findMostSpecificActivePlatform(Ctx)) {
+    if (attr != D->getActiveAvailableAttrForCurrentPlatform()) {
       return;
     }
   }
 
-  SourceLoc attrLoc = attr->getLocation();
+  if (attr->getPlatform() == PlatformKind::iOS &&
+      isPlatformActive(PlatformKind::visionOS, Ctx.LangOpts)) {
+    if (attr != D->getActiveAvailableAttrForCurrentPlatform()) {
+      return;
+    }
+  }
+
+  // The remaining diagnostics are only for attributes with introduced versions
+  // for specific platforms.
+  if (!attr->isPlatformSpecific() || !attr->getIntroduced().has_value())
+    return;
 
   // Find the innermost enclosing declaration with an availability
   // range annotation and ensure that this attribute's available version range
   // is fully contained within that declaration's range. If there is no such
   // enclosing declaration, then there is nothing to check.
-  Optional<AvailabilityContext> EnclosingAnnotatedRange;
-  AvailabilityContext AttrRange{
-      VersionRange::allGTE(attr->Introduced.value())};
+  std::optional<AvailabilityRange> EnclosingAnnotatedRange;
+  AvailabilityRange AttrRange = attr->getIntroducedRange(Ctx);
 
   if (auto *parent = getEnclosingDeclForDecl(D)) {
-    if (auto enclosingUnavailable = parent->getSemanticUnavailableAttr()) {
-      if (!AttrRange.isKnownUnreachable()) {
-        const Decl *enclosingDecl = enclosingUnavailable.value().second;
-        diagnose(D->isImplicit() ? enclosingDecl->getLoc()
-                                 : attr->getLocation(),
-                 diag::availability_decl_more_than_unavailable_enclosing,
-                 D->getDescriptiveKind());
-        diagnose(parent->getLoc(),
-                 diag::availability_decl_more_than_unavailable_enclosing_here);
-      }
-    } else if (auto enclosingAvailable =
-                   parent->getSemanticAvailableRangeAttr()) {
-      const AvailableAttr *enclosingAttr = enclosingAvailable.value().first;
-      const Decl *enclosingDecl = enclosingAvailable.value().second;
-      EnclosingAnnotatedRange.emplace(
-          VersionRange::allGTE(enclosingAttr->Introduced.value()));
+    if (auto enclosingAvailable =
+            getSemanticAvailableRangeDeclAndAttr(parent)) {
+      SemanticAvailableAttr enclosingAttr = enclosingAvailable->first;
+      const Decl *enclosingDecl = enclosingAvailable->second;
+      EnclosingAnnotatedRange.emplace(enclosingAttr.getIntroducedRange(Ctx));
       if (!AttrRange.isContainedIn(*EnclosingAnnotatedRange)) {
-        // Members of extensions of nominal types with available ranges were
-        // not diagnosed previously, so only emit a warning in that case.
-        auto limit = (enclosingDecl != parent && isa<ExtensionDecl>(parent))
-                         ? DiagnosticBehavior::Warning
-                         : DiagnosticBehavior::Unspecified;
+        auto limit = DiagnosticBehavior::Unspecified;
+        if (D->isImplicit()) {
+          // Incorrect availability for an implicit declaration is likely a
+          // compiler bug so make the diagnostic a warning.
+          limit = DiagnosticBehavior::Warning;
+        } else if (enclosingDecl != parent) {
+          // Members of extensions of nominal types with available ranges were
+          // not diagnosed previously, so only emit a warning in that case.
+          if (isa<ExtensionDecl>(DC->getTopmostDeclarationDeclContext()))
+            limit = DiagnosticBehavior::Warning;
+        }
         diagnose(D->isImplicit() ? enclosingDecl->getLoc()
-                                 : attr->getLocation(),
+                                 : parsedAttr->getLocation(),
                  diag::availability_decl_more_than_enclosing,
                  D->getDescriptiveKind())
             .limitBehavior(limit);
@@ -1919,27 +2456,39 @@ void AttributeChecker::visitAvailableAttr(AvailableAttr *attr) {
           diagnose(enclosingDecl->getLoc(),
                    diag::availability_implicit_decl_here,
                    D->getDescriptiveKind(),
-                   prettyPlatformString(targetPlatform(Ctx.LangOpts)),
-                   AttrRange.getOSVersion().getLowerEndpoint());
+                   Ctx.getTargetPlatformStringForDiagnostics(),
+                   AttrRange.getRawMinimumVersion());
         diagnose(enclosingDecl->getLoc(),
                  diag::availability_decl_more_than_enclosing_here,
-                 prettyPlatformString(targetPlatform(Ctx.LangOpts)),
-                 EnclosingAnnotatedRange->getOSVersion().getLowerEndpoint());
+                 Ctx.getTargetPlatformStringForDiagnostics(),
+                 EnclosingAnnotatedRange->getRawMinimumVersion());
       }
     }
   }
+}
 
-  Optional<Diag<>> MaybeNotAllowed =
-      TypeChecker::diagnosticIfDeclCannotBePotentiallyUnavailable(D);
-  if (MaybeNotAllowed.has_value()) {
-    AvailabilityContext DeploymentRange
-        = AvailabilityContext::forDeploymentTarget(Ctx);
-    if (EnclosingAnnotatedRange.has_value())
-      DeploymentRange.intersectWith(*EnclosingAnnotatedRange);
-
-    if (!DeploymentRange.isContainedIn(AttrRange))
-      diagnose(attrLoc, MaybeNotAllowed.value());
+static bool canDeclareSymbolName(StringRef symbol, ModuleDecl *fromModule) {
+  // The Swift standard library needs to be able to define reserved symbols.
+  if (fromModule->isStdlibModule()
+      || fromModule->getName() == fromModule->getASTContext().Id_Concurrency
+      || fromModule->getName() == fromModule->getASTContext().Id_Distributed) {
+    return true;
   }
+
+  // Swift runtime functions are a private contract between the compiler and
+  // runtime, and attempting to access them directly without going through
+  // builtins or proper language features breaks the compiler in various hard
+  // to predict ways. Warn when code attempts to do so; hopefully we can
+  // promote this to an error after a while.
+  
+#define FUNCTION(_, Module, Name, ...) \
+  if (symbol == #Name) { return false; } \
+  if (symbol == "_" #Name) { return false; } \
+  if (symbol == #Name "_") { return false; } \
+  if (symbol == "_" #Name "_") { return false; }
+#include "swift/Runtime/RuntimeFunctions.def"
+
+  return true;
 }
 
 void AttributeChecker::visitCDeclAttr(CDeclAttr *attr) {
@@ -1950,58 +2499,263 @@ void AttributeChecker::visitCDeclAttr(CDeclAttr *attr) {
   // The name must not be empty.
   if (attr->Name.empty())
     diagnose(attr->getLocation(), diag::cdecl_empty_name);
+
+  // The standard library can use @_cdecl to implement runtime functions.
+  if (!canDeclareSymbolName(attr->Name, D->getModuleContext())) {
+      diagnose(attr->getLocation(), diag::reserved_runtime_symbol_name,
+               attr->Name);
+  }
 }
 
 void AttributeChecker::visitExposeAttr(ExposeAttr *attr) {
-  auto *VD = cast<ValueDecl>(D);
-  // Expose cannot be mixed with '@objc'/'@_cdecl' declarations.
-  if (VD->isObjC())
-    diagnose(attr->getLocation(), diag::expose_only_non_other_attr, "@objc");
-  if (VD->getAttrs().hasAttribute<CDeclAttr>())
-    diagnose(attr->getLocation(), diag::expose_only_non_other_attr, "@_cdecl");
-
-  // Nested exposed declarations are expected to be inside
-  // of other exposed declarations.
-  bool hasExpose = true;
-  const ValueDecl *decl = VD;
-  while (const NominalTypeDecl *NMT =
-             dyn_cast<NominalTypeDecl>(decl->getDeclContext())) {
-    decl = NMT;
-    hasExpose = NMT->getAttrs().hasAttribute<ExposeAttr>();
+  switch (attr->getExposureKind()) {
+  case ExposureKind::Wasm: {
+    // Only top-level func decls are currently supported.
+    if (!isa<FuncDecl>(D) || D->getDeclContext()->isTypeContext())
+      diagnose(attr->getLocation(), diag::expose_wasm_not_at_top_level_func);
+    break;
   }
-  if (!hasExpose) {
-    diagnose(attr->getLocation(), diag::expose_inside_unexposed_decl,
-             decl->getName());
+  case ExposureKind::Cxx: {
+    auto *VD = cast<ValueDecl>(D);
+    // Expose cannot be mixed with '@_cdecl' declarations.
+    if (!VD->getCDeclName().empty())
+      diagnose(attr->getLocation(), diag::expose_only_non_other_attr, "@_cdecl");
+
+    // Nested exposed declarations are expected to be inside
+    // of other exposed declarations.
+    bool hasExpose = true;
+    const ValueDecl *decl = VD;
+    while (const NominalTypeDecl *NMT =
+               dyn_cast<NominalTypeDecl>(decl->getDeclContext())) {
+      decl = NMT;
+      hasExpose = NMT->getAttrs().hasAttribute<ExposeAttr>();
+    }
+    if (!hasExpose) {
+      diagnose(attr->getLocation(), diag::expose_inside_unexposed_decl, decl);
+    }
+
+    // Verify that the declaration is exposable.
+    auto repr = cxx_translation::getDeclRepresentation(VD, std::nullopt);
+    if (repr.isUnsupported())
+      diagnose(attr->getLocation(),
+               cxx_translation::diagnoseRepresenationError(*repr.error, VD));
+
+    // Verify that the name mentioned in the expose
+    // attribute matches the supported name pattern.
+    if (!attr->Name.empty()) {
+      if (isa<ConstructorDecl>(VD) && !attr->Name.starts_with("init"))
+        diagnose(attr->getLocation(), diag::expose_invalid_name_pattern_init,
+                 attr->Name);
+    }
+    break;
+  }
+  }
+}
+
+bool IsCCompatibleFuncDeclRequest::evaluate(Evaluator &evaluator,
+                                            FuncDecl *FD) const {
+  if (FD->isInvalid())
+    return false;
+
+  bool foundError = false;
+
+  if (FD->hasAsync()) {
+    FD->diagnose(diag::c_func_async);
+    foundError = true;
   }
 
-  // Verify that the declaration is exposable.
-  auto repr = cxx_translation::getDeclRepresentation(VD);
-  if (repr.isUnsupported()) {
-    using namespace cxx_translation;
-    switch (*repr.error) {
-    case UnrepresentableAsync:
-      diagnose(attr->getLocation(), diag::expose_unsupported_async_decl_to_cxx,
-               VD->getDescriptiveKind(), VD);
-      break;
-    case UnrepresentableIsolatedInActor:
-      diagnose(attr->getLocation(),
-               diag::expose_unsupported_actor_isolated_to_cxx,
-               VD->getDescriptiveKind(), VD);
-      break;
-    case UnrepresentableRequiresClientEmission:
-      diagnose(attr->getLocation(),
-               diag::expose_unsupported_client_emission_to_cxx,
-               VD->getDescriptiveKind(), VD);
-      break;
+  if (FD->hasThrows()) {
+    FD->diagnose(diag::c_func_throws);
+    foundError = true;
+  }
+
+  // --- Check for unsupported result types.
+  Type resultTy = FD->getResultInterfaceType();
+  if (!resultTy->isVoid() && !resultTy->isRepresentableIn(ForeignLanguage::C, FD)) {
+    FD->diagnose(diag::c_func_unsupported_type, resultTy);
+    foundError = true;
+  }
+
+  for (auto *param : *FD->getParameters()) {
+    // --- Check for unsupported specifiers.
+    if (param->isVariadic()) {
+      FD->diagnose(diag::c_func_variadic, param->getName(), FD);
+      foundError = true;
+    }
+    if (param->getSpecifier() != ParamSpecifier::Default) {
+      param
+          ->diagnose(diag::c_func_unsupported_specifier,
+                     ParamDecl::getSpecifierSpelling(param->getSpecifier()),
+                     param->getName(), FD)
+          .fixItRemove(param->getSpecifierLoc());
+      foundError = true;
+    }
+
+    // --- Check for unsupported parameter types.
+    auto paramTy = param->getTypeInContext();
+    if (!paramTy->isRepresentableIn(ForeignLanguage::C, FD)) {
+      param->diagnose(diag::c_func_unsupported_type, paramTy);
+      foundError = true;
+    }
+  }
+  return !foundError;
+}
+
+static bool isCCompatibleFuncDecl(FuncDecl *FD) {
+  return evaluateOrDefault(FD->getASTContext().evaluator,
+                           IsCCompatibleFuncDeclRequest{FD}, {});
+}
+
+void AttributeChecker::visitExternAttr(ExternAttr *attr) {
+  if (!Ctx.LangOpts.hasFeature(Feature::Extern)
+      && !D->getModuleContext()->isStdlibModule()) {
+    diagnoseAndRemoveAttr(attr, diag::attr_extern_experimental);
+    return;
+  }
+  
+  // Only top-level func or static func decls are currently supported.
+  auto *FD = dyn_cast<FuncDecl>(D);
+  if (!FD || (FD->getDeclContext()->isTypeContext() && !FD->isStatic())) {
+    diagnose(attr->getLocation(), diag::extern_not_at_top_level_func);
+  }
+
+
+  // C name must not be empty.
+  if (attr->getExternKind() == ExternKind::C) {
+    StringRef cName = attr->getCName(FD);
+    if (cName.empty()) {
+      diagnose(attr->getLocation(), diag::extern_empty_c_name);
+    } else if (!attr->Name.has_value() && !clang::isValidAsciiIdentifier(cName)) {
+      // Warn non ASCII identifiers if it's *implicitly* specified. The C standard allows
+      // Universal Character Names in identifiers, but clang doesn't provide
+      // an easy way to validate them, so we warn identifers that is potentially
+      // invalid. If it's explicitly specified, we assume the user knows what
+      // they are doing, and don't warn.
+      diagnose(attr->getLocation(), diag::extern_c_maybe_invalid_name, cName)
+          .fixItInsert(attr->getRParenLoc(), (", \"" + cName + "\"").str());
+    }
+    
+    // Diagnose reserved symbol names.
+    // The standard library can't use normal C interop so needs extern(c)
+    // for access to C standard library and ObjC/Swift runtime functions.
+    if (!canDeclareSymbolName(cName, D->getModuleContext())) {
+      diagnose(attr->getLocation(), diag::reserved_runtime_symbol_name,
+               cName);
+    }
+
+    // Ensure the decl has C compatible interface. Otherwise it produces diagnostics.
+    if (!isCCompatibleFuncDecl(FD)) {
+      attr->setInvalid();
+      // Mark the decl itself invalid not to require body even with invalid ExternAttr.
+      FD->setInvalid();
     }
   }
 
-  // Verify that the name mentioned in the expose
-  // attribute matches the supported name pattern.
-  if (!attr->Name.empty()) {
-    if (isa<ConstructorDecl>(VD) && !attr->Name.startswith("init"))
-      diagnose(attr->getLocation(), diag::expose_invalid_name_pattern_init,
-               attr->Name);
+  for (auto *otherAttr : D->getAttrs()) {
+    // @_cdecl cannot be mixed with @_extern since @_cdecl is for definitions
+    // @_silgen_name cannot be mixed to avoid SIL-level name ambiguity
+    if (isa<CDeclAttr>(otherAttr) || isa<SILGenNameAttr>(otherAttr)) {
+      diagnose(attr->getLocation(), diag::extern_only_non_other_attr,
+               otherAttr->getAttrName());
+    }
+  }
+}
+
+static bool allowSymbolLinkageMarkers(ASTContext &ctx, Decl *D) {
+  if (ctx.LangOpts.hasFeature(Feature::SymbolLinkageMarkers))
+    return true;
+
+  auto *sourceFile = D->getDeclContext()->getParentModule()
+      ->getSourceFileContainingLocation(D->getStartLoc());
+  if (!sourceFile)
+    return false;
+
+  auto expansion = sourceFile->getMacroExpansion();
+  auto *macroAttr = sourceFile->getAttachedMacroAttribute();
+  if (!expansion || !macroAttr)
+    return false;
+
+  auto *decl = expansion.dyn_cast<Decl *>();
+  if (!decl)
+    return false;
+
+  auto *macroDecl = decl->getResolvedMacro(macroAttr);
+  if (!macroDecl)
+    return false;
+
+  if (macroDecl->getParentModule()->isStdlibModule() &&
+      macroDecl->getName().getBaseIdentifier()
+          .str() == "_DebugDescriptionProperty")
+    return true;
+
+  return false;
+}
+
+void AttributeChecker::visitSILGenNameAttr(SILGenNameAttr *A) {
+  if (!canDeclareSymbolName(A->Name, D->getModuleContext())) {
+    diagnose(A->getLocation(), diag::reserved_runtime_symbol_name,
+             A->Name);
+  }
+
+  if (D->getAttrs().hasAttribute<ABIAttr>()) {
+    diagnoseAndRemoveAttr(A, diag::attr_abi_incompatible_with_silgen_name,
+                          D->getDescriptiveKind());
+  }
+}
+
+void AttributeChecker::visitUsedAttr(UsedAttr *attr) {
+  if (!allowSymbolLinkageMarkers(Ctx, D)) {
+    diagnoseAndRemoveAttr(attr, diag::section_linkage_markers_disabled);
+    return;
+  }
+
+  if (D->getDeclContext()->isLocalContext())
+    diagnose(attr->getLocation(), diag::attr_only_at_non_local_scope,
+             attr->getAttrName());
+  else if (D->getDeclContext()->isGenericContext() &&
+           !D->getDeclContext()
+                ->getGenericSignatureOfContext()
+                ->areAllParamsConcrete())
+    diagnose(attr->getLocation(), diag::attr_only_at_non_generic_scope,
+             attr->getAttrName());
+  else if (auto *VarD = dyn_cast<VarDecl>(D)) {
+    if (!VarD->isStatic() && !D->getDeclContext()->isModuleScopeContext()) {
+      diagnose(attr->getLocation(), diag::attr_only_on_static_properties,
+               attr->getAttrName());
+    } else if (!VarD->hasStorageOrWrapsStorage()) {
+      diagnose(attr->getLocation(), diag::attr_not_on_computed_properties,
+               attr);
+    }
+  }
+}
+
+void AttributeChecker::visitSectionAttr(SectionAttr *attr) {
+  if (!allowSymbolLinkageMarkers(Ctx, D)) {
+    diagnoseAndRemoveAttr(attr, diag::section_linkage_markers_disabled);
+    return;
+  }
+
+  // The name must not be empty.
+  if (attr->Name.empty())
+    diagnose(attr->getLocation(), diag::section_empty_name);
+
+  if (D->getDeclContext()->isLocalContext())
+    return; // already diagnosed
+
+  if (D->getDeclContext()->isGenericContext() &&
+      !D->getDeclContext()
+           ->getGenericSignatureOfContext()
+           ->areAllParamsConcrete())
+    diagnose(attr->getLocation(), diag::attr_only_at_non_generic_scope,
+             attr->getAttrName());
+  else if (auto *VarD = dyn_cast<VarDecl>(D)) {
+    if (!VarD->isStatic() && !D->getDeclContext()->isModuleScopeContext()) {
+      diagnose(attr->getLocation(), diag::attr_only_on_static_properties,
+               attr->getAttrName());
+    } else if (!VarD->hasStorageOrWrapsStorage()) {
+      diagnose(attr->getLocation(), diag::attr_not_on_computed_properties,
+               attr);
+    }
   }
 }
 
@@ -2077,10 +2831,8 @@ void AttributeChecker::visitFinalAttr(FinalAttr *attr) {
 
   if (auto *accessor = dyn_cast<AccessorDecl>(D)) {
     if (!attr->isImplicit()) {
-      unsigned Kind = 2;
-      if (auto *VD = dyn_cast<VarDecl>(accessor->getStorage()))
-        Kind = VD->isLet() ? 1 : 0;
-      diagnose(attr->getLocation(), diag::final_not_on_accessors, Kind)
+      diagnose(attr->getLocation(), diag::final_not_on_accessors,
+               isa<VarDecl>(accessor->getStorage()))
         .fixItRemove(attr->getRange());
       return;
     }
@@ -2088,15 +2840,20 @@ void AttributeChecker::visitFinalAttr(FinalAttr *attr) {
 }
 
 void AttributeChecker::visitMoveOnlyAttr(MoveOnlyAttr *attr) {
-  if (!D->getASTContext().LangOpts.hasFeature(Feature::MoveOnly)) {
-    auto error =
-        diag::experimental_moveonly_feature_can_only_be_used_when_enabled;
-    diagnoseAndRemoveAttr(attr, error);
-    return;
-  }
+  // This attribute is deprecated and slated for removal.
+  diagnose(attr->getLocation(), diag::moveOnly_deprecated)
+    .fixItRemove(attr->getRange())
+    .warnInSwiftInterface(D->getDeclContext());
 
-  if (isa<NominalTypeDecl>(D))
+
+  if (isa<StructDecl>(D) || isa<EnumDecl>(D))
     return;
+
+  // for development purposes, allow it if specifically requested for classes.
+  if (D->getASTContext().LangOpts.hasFeature(Feature::MoveOnlyClasses)) {
+    if (isa<ClassDecl>(D))
+      return;
+  }
 
   diagnose(attr->getLocation(), diag::moveOnly_not_allowed_here)
     .fixItRemove(attr->getRange());
@@ -2254,19 +3011,30 @@ void AttributeChecker::checkApplicationMainAttribute(DeclAttribute *attr,
     namelookup::lookupInModule(KitModule, Id_ApplicationDelegate,
                                decls, NLKind::QualifiedLookup,
                                namelookup::ResolutionKind::TypesOnly,
-                               SF, NL_QualifiedDefault);
+                               SF, attr->getLocation(),
+                               NL_QualifiedDefault);
     if (decls.size() == 1)
       ApplicationDelegateProto = dyn_cast<ProtocolDecl>(decls[0]);
   }
 
   if (!ApplicationDelegateProto ||
-      !TypeChecker::conformsToProtocol(CD->getDeclaredInterfaceType(),
-                                       ApplicationDelegateProto,
-                                       CD->getParentModule())) {
+      !checkConformance(CD->getDeclaredInterfaceType(),
+                        ApplicationDelegateProto)) {
     diagnose(attr->getLocation(),
              diag::attr_ApplicationMain_not_ApplicationDelegate,
              applicationMainKind);
     attr->setInvalid();
+  }
+
+  if (C.LangOpts.hasFeature(Feature::DeprecateApplicationMain)) {
+    diagnose(attr->getLocation(),
+             diag::attr_ApplicationMain_deprecated,
+             applicationMainKind)
+      .warnUntilSwiftVersion(6);
+
+    diagnose(attr->getLocation(),
+             diag::attr_ApplicationMain_deprecated_use_attr_main)
+      .fixItReplace(attr->getRange(), "@main");
   }
 
   if (attr->isInvalid())
@@ -2316,7 +3084,7 @@ synthesizeMainBody(AbstractFunctionDecl *fn, void *arg) {
     substitutionMap = SubstitutionMap::get(
       environment->getGenericSignature(),
       [&](SubstitutableType *type) { return nominal->getDeclaredType(); },
-      LookUpConformanceInModule(nominal->getModuleContext()));
+      LookUpConformanceInModule());
   } else {
     substitutionMap = SubstitutionMap();
   }
@@ -2366,8 +3134,7 @@ synthesizeMainBody(AbstractFunctionDecl *fn, void *arg) {
     returnedExpr = callExpr;
   }
 
-  auto *returnStmt =
-      new (context) ReturnStmt(SourceLoc(), returnedExpr, /*Implicit=*/true);
+  auto *returnStmt = ReturnStmt::createImplicit(context, returnedExpr);
 
   SmallVector<ASTNode, 1> stmts;
   stmts.push_back(returnStmt);
@@ -2434,49 +3201,36 @@ SynthesizeMainFunctionRequest::evaluate(Evaluator &evaluator,
                       ConstraintSystemFlags::IgnoreAsyncSyncMismatch);
   ConstraintLocator *locator =
       CS.getConstraintLocator({}, ConstraintLocator::Member);
+  auto throwsTypeVar = CS.createTypeVariable(locator, 0);
+
   // Allowed main function types
-  // `() -> Void`
-  // `() async -> Void`
-  // `() throws -> Void`
-  // `() async throws -> Void`
-  // `@MainActor () -> Void`
-  // `@MainActor () async -> Void`
-  // `@MainActor () throws -> Void`
-  // `@MainActor () async throws -> Void`
+  // `() throws(E) -> Void`
+  // `() async throws(E) -> Void`
+  // `@MainActor () throws(E) -> Void`
+  // `@MainActor () async throws(E) -> Void`
   {
-    llvm::SmallVector<Type, 8> mainTypes = {
-
+    llvm::SmallVector<Type, 4> mainTypes = {
         FunctionType::get(/*params*/ {}, context.TheEmptyTupleType,
-                          ASTExtInfo()),
-        FunctionType::get(
-            /*params*/ {}, context.TheEmptyTupleType,
-            ASTExtInfoBuilder().withAsync().build()),
-
-        FunctionType::get(/*params*/ {}, context.TheEmptyTupleType,
-                          ASTExtInfoBuilder().withThrows().build()),
+                          ASTExtInfoBuilder().withThrows(
+                            true, throwsTypeVar
+                          ).build()),
 
         FunctionType::get(
             /*params*/ {}, context.TheEmptyTupleType,
-            ASTExtInfoBuilder().withAsync().withThrows().build())};
+            ASTExtInfoBuilder().withAsync()
+                .withThrows(true, throwsTypeVar).build())};
 
     Type mainActor = context.getMainActorType();
     if (mainActor) {
+      auto extInfo = ASTExtInfoBuilder().withIsolation(
+          FunctionTypeIsolation::forGlobalActor(mainActor))
+        .withThrows(true, throwsTypeVar);
       mainTypes.push_back(FunctionType::get(
           /*params*/ {}, context.TheEmptyTupleType,
-          ASTExtInfoBuilder().withGlobalActor(mainActor).build()));
+          extInfo.build()));
       mainTypes.push_back(FunctionType::get(
           /*params*/ {}, context.TheEmptyTupleType,
-          ASTExtInfoBuilder().withAsync().withGlobalActor(mainActor).build()));
-      mainTypes.push_back(FunctionType::get(
-          /*params*/ {}, context.TheEmptyTupleType,
-          ASTExtInfoBuilder().withThrows().withGlobalActor(mainActor).build()));
-      mainTypes.push_back(FunctionType::get(/*params*/ {},
-                                            context.TheEmptyTupleType,
-                                            ASTExtInfoBuilder()
-                                                .withAsync()
-                                                .withThrows()
-                                                .withGlobalActor(mainActor)
-                                                .build()));
+          extInfo.withAsync().build()));
     }
     TypeVariableType *mainType =
         CS.createTypeVariable(locator, /*options=*/0);
@@ -2491,7 +3245,8 @@ SynthesizeMainFunctionRequest::evaluate(Evaluator &evaluator,
     CS.addDisjunctionConstraint(typeEqualityConstraints, locator);
     CS.addValueMemberConstraint(
         nominal->getInterfaceType(), DeclNameRef(context.Id_main),
-        Type(mainType), declContext, FunctionRefKind::SingleApply, {}, locator);
+        Type(mainType), declContext, FunctionRefInfo::singleBaseNameApply(), {},
+        locator);
   }
 
   FuncDecl *mainFunction = nullptr;
@@ -2516,21 +3271,22 @@ SynthesizeMainFunctionRequest::evaluate(Evaluator &evaluator,
 
   if (!mainFunction) {
     const bool hasAsyncSupport =
-        AvailabilityContext::forDeploymentTarget(context).isContainedIn(
+        AvailabilityRange::forDeploymentTarget(context).isContainedIn(
             context.getBackDeployedConcurrencyAvailability());
     context.Diags.diagnose(attr->getLocation(),
                            diag::attr_MainType_without_main,
-                           nominal->getBaseName(), hasAsyncSupport);
+                           nominal, hasAsyncSupport);
     attr->setInvalid();
     return nullptr;
   }
 
   auto where = ExportContext::forDeclSignature(D);
-  diagnoseDeclAvailability(mainFunction, attr->getRange(), nullptr, where, None);
+  diagnoseDeclAvailability(mainFunction, attr->getRange(), nullptr, where,
+                           std::nullopt);
 
   if (mainFunction->hasAsync() &&
       context.LangOpts.isConcurrencyModelTaskToThread() &&
-      !AvailableAttr::isUnavailable(mainFunction)) {
+      !mainFunction->isUnavailable()) {
     mainFunction->diagnose(diag::concurrency_task_to_thread_model_async_main,
                            "task-to-thread concurrency model");
     return nullptr;
@@ -2543,6 +3299,7 @@ SynthesizeMainFunctionRequest::evaluate(Evaluator &evaluator,
       /*NameLoc=*/SourceLoc(),
       /*Async=*/mainFunction->hasAsync(),
       /*Throws=*/mainFunction->hasThrows(),
+      mainFunction->getThrownInterfaceType(),
       /*GenericParams=*/nullptr, ParameterList::createEmpty(context),
       /*FnRetType=*/TupleType::getEmpty(context), declContext);
   func->setSynthesized(true);
@@ -2614,7 +3371,7 @@ void AttributeChecker::visitRequiredAttr(RequiredAttr *attr) {
     // The constructor must be declared within the class itself.
     // FIXME: Allow an SDK overlay to add a required initializer to a class
     // defined in Objective-C
-    if (!isa<ClassDecl>(ctor->getDeclContext()) &&
+    if (!isa<ClassDecl>(ctor->getDeclContext()->getImplementedObjCContext()) &&
         !isObjCClassExtensionInOverlay(ctor->getDeclContext())) {
       diagnose(ctor, diag::required_initializer_in_extension, parentTy)
         .highlight(attr->getLocation());
@@ -2749,13 +3506,30 @@ void AttributeChecker::visitSpecializeAttr(SpecializeAttr *attr) {
     return;
   }
 
+  (void)attr->getSpecializedSignature(FD);
+}
+
+GenericSignature
+SerializeAttrGenericSignatureRequest::evaluate(Evaluator &evaluator,
+                                               const AbstractFunctionDecl *FD,
+                                               SpecializeAttr *attr) const {
+  if (attr->specializedSignature)
+    return attr->specializedSignature;
+
+  auto &Ctx = FD->getASTContext();
+  auto genericSig = FD->getGenericSignature();
+  if (!genericSig)
+    return nullptr;
+
   InferredGenericSignatureRequest request{
       genericSig.getPointer(),
       /*genericParams=*/nullptr,
-      WhereClauseOwner(FD, attr),
+      WhereClauseOwner(const_cast<AbstractFunctionDecl *>(FD), attr),
       /*addedRequirements=*/{},
       /*inferenceSources=*/{},
-      /*allowConcreteGenericParams=*/true};
+      attr->getLocation(),
+      /*forExtension=*/nullptr,
+      /*allowInverses=*/true};
 
   auto specializedSig = evaluateOrDefault(Ctx.evaluator, request,
                                           GenericSignatureWithError())
@@ -2766,13 +3540,18 @@ void AttributeChecker::visitSpecializeAttr(SpecializeAttr *attr) {
 
   if (Ctx.LangOpts.hasFeature(Feature::LayoutPrespecialization)) {
     llvm::SmallVector<Type, 4> typeErasedParams;
-    for (const auto &pair : llvm::zip(attr->getTrailingWhereClause()->getRequirements(), specializedSig.getRequirements())) {
-      auto &reqRepr = std::get<0>(pair);
-      auto &req = std::get<1>(pair);
+    for (const auto &reqRepr :
+         attr->getTrailingWhereClause()->getRequirements()) {
       if (reqRepr.getKind() == RequirementReprKind::LayoutConstraint) {
         if (auto *attributedTy = dyn_cast<AttributedTypeRepr>(reqRepr.getSubjectRepr())) {
-          if (attributedTy->getAttrs().has(TAK__noMetadata)) {
-            typeErasedParams.push_back(req.getFirstType());
+          if (attributedTy->has(TypeAttrKind::NoMetadata)) {
+            const auto resolution = TypeResolution::forInterface(
+                FD->getDeclContext(), genericSig, std::nullopt,
+                /*unboundTyOpener*/ nullptr,
+                /*placeholderHandler*/ nullptr,
+                /*packElementOpener*/ nullptr);
+            const auto ty = resolution.resolveType(attributedTy);
+            typeErasedParams.push_back(ty);
           }
         }
       }
@@ -2780,10 +3559,26 @@ void AttributeChecker::visitSpecializeAttr(SpecializeAttr *attr) {
     attr->setTypeErasedParams(typeErasedParams);
   }
 
-  attr->setSpecializedSignature(specializedSig);
-
   // Check the target function if there is one.
   attr->getTargetFunctionDecl(FD);
+
+  return specializedSig;
+}
+
+std::optional<GenericSignature>
+SerializeAttrGenericSignatureRequest::getCachedResult() const {
+  const auto &storage = getStorage();
+  SpecializeAttr *attr = std::get<1>(storage);
+  if (auto signature = attr->specializedSignature)
+    return signature;
+  return std::nullopt;
+}
+
+void SerializeAttrGenericSignatureRequest::cacheResult(
+    GenericSignature signature) const {
+  const auto &storage = getStorage();
+  SpecializeAttr *attr = std::get<1>(storage);
+  attr->specializedSignature = signature;
 }
 
 void AttributeChecker::visitFixedLayoutAttr(FixedLayoutAttr *attr) {
@@ -2794,7 +3589,7 @@ void AttributeChecker::visitFixedLayoutAttr(FixedLayoutAttr *attr) {
 
   auto *VD = cast<ValueDecl>(D);
 
-  if (VD->getFormalAccess() < AccessLevel::Public &&
+  if (VD->getFormalAccess() < AccessLevel::Package &&
       !VD->getAttrs().hasAttribute<UsableFromInlineAttr>()) {
     diagnoseAndRemoveAttr(attr, diag::fixed_layout_attr_on_internal_type,
                           VD->getName(), VD->getFormalAccess());
@@ -2811,11 +3606,12 @@ void AttributeChecker::visitUsableFromInlineAttr(UsableFromInlineAttr *attr) {
     return;
   }
 
-  // @usableFromInline can only be applied to internal declarations.
-  if (VD->getFormalAccess() != AccessLevel::Internal) {
+  // @usableFromInline can only be applied to internal or package declarations.
+  if (VD->getFormalAccess() != AccessLevel::Internal &&
+      VD->getFormalAccess() != AccessLevel::Package) {
     diagnoseAndRemoveAttr(attr,
                           diag::usable_from_inline_attr_with_explicit_access,
-                          VD->getName(), VD->getFormalAccess());
+                          VD, VD->getFormalAccess());
     return;
   }
 
@@ -2823,7 +3619,7 @@ void AttributeChecker::visitUsableFromInlineAttr(UsableFromInlineAttr *attr) {
   if (VD->getAttrs().hasAttribute<InlinableAttr>()) {
     if (Ctx.isSwiftVersionAtLeast(4,2))
       diagnoseAndRemoveAttr(attr, diag::inlinable_implies_usable_from_inline,
-                            VD->getDescriptiveKind(), VD->getName());
+                            VD);
     return;
   }
 }
@@ -2852,7 +3648,8 @@ void AttributeChecker::visitInlinableAttr(InlinableAttr *attr) {
     return;
   }
 
-  // @inlinable can only be applied to public or internal declarations.
+  // @inlinable can only be applied to public, package, or
+  // internal declarations.
   auto access = VD->getFormalAccess();
   if (access < AccessLevel::Internal) {
     diagnoseAndRemoveAttr(attr, diag::inlinable_decl_not_public,
@@ -2885,22 +3682,27 @@ void AttributeChecker::visitOptimizeAttr(OptimizeAttr *attr) {
 
 void AttributeChecker::visitExclusivityAttr(ExclusivityAttr *attr) {
   if (auto *varDecl = dyn_cast<VarDecl>(D)) {
-    if (!varDecl->hasStorage()) {
-      diagnose(attr->getLocation(), diag::exclusivity_on_computed_property);
-      attr->setInvalid();
-      return;
+    auto *DC = D->getDeclContext();
+    auto *parentSF = DC->getParentSourceFile();
+
+    if (parentSF && parentSF->Kind != SourceFileKind::Interface) {
+      if (!varDecl->hasStorage()) {
+        diagnose(attr->getLocation(), diag::exclusivity_on_computed_property);
+        attr->setInvalid();
+        return;
+      }
     }
-  
-    if (isa<ClassDecl>(varDecl->getDeclContext()))
+
+    if (isa<ClassDecl>(DC))
       return;
-    
-    if (varDecl->getDeclContext()->isTypeContext() && !varDecl->isInstanceMember())
+
+    if (DC->isTypeContext() && !varDecl->isInstanceMember())
       return;
-    
-    if (varDecl->getDeclContext()->isModuleScopeContext())
+
+    if (DC->isModuleScopeContext())
       return;
   }
-  diagnose(attr->getLocation(), diag::exclusivity_on_wrong_decl);
+  diagnoseAndRemoveAttr(attr, diag::exclusivity_on_wrong_decl);
   attr->setInvalid();
 }
 
@@ -2957,7 +3759,8 @@ static void lookupReplacedDecl(DeclNameRef replacedDeclName,
     options |= NL_IncludeUsableFromInline;
 
   if (typeCtx)
-    moduleScopeCtxt->lookupQualified({typeCtx}, replacedDeclName, options,
+    moduleScopeCtxt->lookupQualified({typeCtx}, replacedDeclName,
+                                     attr->getLocation(), options,
                                      results);
 }
 
@@ -3060,7 +3863,8 @@ static FuncDecl *findSimilarAccessor(DeclNameRef replacedVarName,
         origStorage->getWriteImpl() == WriteImplKind::Stored)) {
     Diags.diagnose(attr->getLocation(),
                    diag::dynamic_replacement_accessor_not_explicit,
-                   (unsigned)origAccessor->getAccessorKind(),
+                   getAccessorNameForDiagnostic(origAccessor,
+                                                /*article=*/false),
                    origStorage->getName());
     attr->setInvalid();
     return nullptr;
@@ -3254,14 +4058,14 @@ ResolveTypeEraserTypeRequest::evaluate(Evaluator &evaluator,
                                        ProtocolDecl *PD,
                                        TypeEraserAttr *attr) const {
   if (auto *typeEraserRepr = attr->getParsedTypeEraserTypeRepr()) {
-    return TypeResolution::resolveContextualType(
-        typeEraserRepr, PD, None,
-        // Unbound generics and placeholders
-        // are not allowed within this
-        // attribute.
-        /*unboundTyOpener*/ nullptr,
-        /*placeholderHandler*/ nullptr,
-        /*packElementOpener*/ nullptr);
+    return TypeResolution::resolveContextualType(typeEraserRepr, PD,
+                                                 std::nullopt,
+                                                 // Unbound generics and
+                                                 // placeholders are not allowed
+                                                 // within this attribute.
+                                                 /*unboundTyOpener*/ nullptr,
+                                                 /*placeholderHandler*/ nullptr,
+                                                 /*packElementOpener*/ nullptr);
   } else {
     auto *LazyResolver = attr->Resolver;
     assert(LazyResolver && "type eraser was neither parsed nor deserialized?");
@@ -3272,6 +4076,38 @@ ResolveTypeEraserTypeRequest::evaluate(Evaluator &evaluator,
     }
     return ty;
   }
+}
+
+Type
+ResolveRawLayoutTypeRequest::evaluate(Evaluator &evaluator, StructDecl *sd,
+                                      RawLayoutAttr *attr,
+                                      bool isLikeType) const {
+  TypeRepr *typeRepr = nullptr;
+
+  if (isLikeType) {
+    assert(attr->LikeType);
+    typeRepr = attr->LikeType;
+  } else {
+    assert(attr->CountType);
+    typeRepr = attr->CountType;
+  }
+
+  // If the attribute has a fixed type representation, then it was likely
+  // deserialized and the type has already been computed.
+  if (auto fixedTy = dyn_cast<FixedTypeRepr>(typeRepr)) {
+    return fixedTy->getType();
+  }
+
+  TypeResolutionOptions options(TypeResolverContext::RawLayoutAttr);
+
+  // Resolve the type in the struct's context.
+  return TypeResolution::resolveContextualType(typeRepr, sd, options,
+                                               // Unbound generics and
+                                               // placeholders are not allowed
+                                               // within this attribute.
+                                               /*unboundTyOpener*/ nullptr,
+                                               /*placeholderHandler*/ nullptr,
+                                               /*packElementOpener*/ nullptr);
 }
 
 bool
@@ -3291,8 +4127,6 @@ TypeEraserHasViableInitRequest::evaluate(Evaluator &evaluator,
 
   // The type eraser must be a concrete nominal type
   auto nominalTypeDecl = typeEraser->getAnyNominal();
-  if (auto typeAliasDecl = dyn_cast_or_null<TypeAliasDecl>(nominalTypeDecl))
-    nominalTypeDecl = typeAliasDecl->getUnderlyingType()->getAnyNominal();
 
   if (!nominalTypeDecl || isa<ProtocolDecl>(nominalTypeDecl)) {
     diags.diagnose(attr->getLoc(), diag::non_nominal_type_eraser);
@@ -3309,7 +4143,7 @@ TypeEraserHasViableInitRequest::evaluate(Evaluator &evaluator,
   }
 
   // The type eraser must conform to the annotated protocol
-  if (!TypeChecker::conformsToProtocol(typeEraser, protocol, module)) {
+  if (!checkConformance(typeEraser, protocol)) {
     diags.diagnose(attr->getLoc(), diag::type_eraser_does_not_conform,
                    typeEraser, protocolType);
     diags.diagnose(nominalTypeDecl->getLoc(), diag::type_eraser_declared_here);
@@ -3353,15 +4187,12 @@ TypeEraserHasViableInitRequest::evaluate(Evaluator &evaluator,
     // type conforming to the annotated protocol. We will check this by
     // substituting the protocol's Self type for the generic arg and check that
     // the requirements in the generic signature are satisfied.
-    auto *module = nominalTypeDecl->getParentModule();
     auto baseMap =
-        typeEraser->getContextSubstitutionMap(module,
-                                              nominalTypeDecl);
+        typeEraser->getContextSubstitutionMap();
     QuerySubstitutionMap getSubstitution{baseMap};
 
-    // Use invalid 'SourceLoc's to suppress diagnostics.
-    auto result = TypeChecker::checkGenericArguments(
-          module, genericSignature.getRequirements(),
+    auto result = checkRequirements(
+          genericSignature.getRequirements(),
           [&](SubstitutableType *type) -> Type {
             if (type->isEqual(genericParamType))
               return protocol->getSelfTypeInContext();
@@ -3369,7 +4200,7 @@ TypeEraserHasViableInitRequest::evaluate(Evaluator &evaluator,
             return getSubstitution(type);
           });
 
-    if (result != CheckGenericArgumentsResult::Success) {
+    if (result != CheckRequirementsResult::Success) {
       unviable.push_back(
           std::make_tuple(init, UnviableReason::UnsatisfiedRequirements,
                           genericParamType));
@@ -3438,9 +4269,11 @@ TypeEraserHasViableInitRequest::evaluate(Evaluator &evaluator,
                        genericParamType, protocol->getName().str());
         break;
       case UnviableReason::Inaccessible:
-        diags.diagnose(init->getLoc(), diag::type_eraser_init_not_accessible,
-                       init->getEffectiveAccess(), protocolType,
-                       protocol->getEffectiveAccess());
+        diags.diagnose(
+            init->getLoc(), diag::type_eraser_init_not_accessible,
+            init->getFormalAccessScope().requiredAccessForDiagnostics(),
+            protocolType,
+            protocol->getFormalAccessScope().requiredAccessForDiagnostics());
         break;
       case UnviableReason::SPI:
         diags.diagnose(init->getLoc(), diag::type_eraser_init_spi,
@@ -3460,72 +4293,72 @@ void AttributeChecker::visitTypeEraserAttr(TypeEraserAttr *attr) {
   (void)attr->hasViableTypeEraserInit(cast<ProtocolDecl>(D));
 }
 
+void AttributeChecker::visitStorageRestrictionsAttr(StorageRestrictionsAttr *attr) {
+  auto *accessor = dyn_cast<AccessorDecl>(D);
+  if (!accessor || accessor->getAccessorKind() != AccessorKind::Init) {
+    diagnose(attr->getLocation(),
+             diag::storage_restrictions_attribute_not_on_init_accessor);
+    return;
+  }
+
+  auto initializesProperties = attr->getInitializesProperties(accessor);
+  for (auto *property : attr->getAccessesProperties(accessor)) {
+    if (llvm::is_contained(initializesProperties, property)) {
+      diagnose(attr->getLocation(),
+               diag::init_accessor_property_both_init_and_accessed,
+               property->getName());
+    }
+  }
+}
+
 void AttributeChecker::visitImplementsAttr(ImplementsAttr *attr) {
   DeclContext *DC = D->getDeclContext();
 
-  Type T = attr->getProtocolType();
-  if (!T && attr->getProtocolTypeRepr()) {
-    auto context = TypeResolverContext::GenericRequirement;
-    T = TypeResolution::resolveContextualType(attr->getProtocolTypeRepr(), DC,
-                                              TypeResolutionOptions(context),
-                                              /*unboundTyOpener*/ nullptr,
-                                              /*placeholderHandler*/ nullptr,
-                                              /*packElementOpener*/ nullptr);
-  }
+  ProtocolDecl *PD = attr->getProtocol(DC);
 
-  // Definite error-types were already diagnosed in resolveType.
-  if (T->hasError())
-    return;
-  attr->setProtocolType(T);
-
-  // Check that we got a ProtocolType.
-  if (auto PT = T->getAs<ProtocolType>()) {
-    ProtocolDecl *PD = PT->getDecl();
-
-    // Check that the ProtocolType has the specified member.
-    LookupResult R =
-        TypeChecker::lookupMember(PD->getDeclContext(), PT,
-                                  DeclNameRef(attr->getMemberName()));
-    if (!R) {
-      diagnose(attr->getLocation(),
-               diag::implements_attr_protocol_lacks_member,
-               PD->getName(), attr->getMemberName())
-        .highlight(attr->getMemberNameLoc().getSourceRange());
-    }
-
-    // Check that the decl we're decorating is a member of a type that actually
-    // conforms to the specified protocol.
-    NominalTypeDecl *NTD = DC->getSelfNominalTypeDecl();
-    if (auto *OtherPD = dyn_cast<ProtocolDecl>(NTD)) {
-      if (!OtherPD->inheritsFrom(PD)) {
-        diagnose(attr->getLocation(),
-                 diag::implements_attr_protocol_not_conformed_to,
-                 NTD->getName(), PD->getName())
-          .highlight(attr->getProtocolTypeRepr()->getSourceRange());
-      }
-    } else {
-      SmallVector<ProtocolConformance *, 2> conformances;
-      if (!NTD->lookupConformance(PD, conformances)) {
-        diagnose(attr->getLocation(),
-                 diag::implements_attr_protocol_not_conformed_to,
-                 NTD->getName(), PD->getName())
-          .highlight(attr->getProtocolTypeRepr()->getSourceRange());
-      }
-    }
-  } else {
+  if (!PD) {
     diagnose(attr->getLocation(), diag::implements_attr_non_protocol_type)
       .highlight(attr->getProtocolTypeRepr()->getSourceRange());
+    return;
+  }
+
+  // Check that the ProtocolType has the specified member.
+  LookupResult R =
+      TypeChecker::lookupMember(PD->getDeclContext(),
+                                PD->getDeclaredInterfaceType(),
+                                DeclNameRef(attr->getMemberName()));
+  if (!R) {
+    diagnose(attr->getLocation(),
+             diag::implements_attr_protocol_lacks_member,
+             PD, attr->getMemberName())
+      .highlight(attr->getMemberNameLoc().getSourceRange());
+    return;
+  }
+
+  // Check that the decl we're decorating is a member of a type that actually
+  // conforms to the specified protocol.
+  NominalTypeDecl *NTD = DC->getSelfNominalTypeDecl();
+  if (auto *OtherPD = dyn_cast<ProtocolDecl>(NTD)) {
+    if (!(OtherPD == PD || OtherPD->inheritsFrom(PD)) &&
+        !(OtherPD->isSpecificProtocol(KnownProtocolKind::DistributedActor) ||
+          PD->isSpecificProtocol(KnownProtocolKind::Actor))) {
+      diagnose(attr->getLocation(),
+               diag::implements_attr_protocol_not_conformed_to, NTD, PD)
+        .highlight(attr->getProtocolTypeRepr()->getSourceRange());
+    }
+  } else {
+    SmallVector<ProtocolConformance *, 2> conformances;
+    if (!NTD->lookupConformance(PD, conformances)) {
+      diagnose(attr->getLocation(),
+               diag::implements_attr_protocol_not_conformed_to, NTD, PD)
+        .highlight(attr->getProtocolTypeRepr()->getSourceRange());
+    }
   }
 }
 
 void AttributeChecker::visitFrozenAttr(FrozenAttr *attr) {
   if (auto *ED = dyn_cast<EnumDecl>(D)) {
-    if (!ED->getModuleContext()->isResilient()) {
-      attr->setInvalid();
-      return;
-    }
-
-    if (ED->getFormalAccess() < AccessLevel::Public &&
+    if (ED->getFormalAccess() < AccessLevel::Package &&
         !ED->getAttrs().hasAttribute<UsableFromInlineAttr>()) {
       diagnoseAndRemoveAttr(attr, diag::enum_frozen_nonpublic, attr);
       return;
@@ -3534,42 +4367,113 @@ void AttributeChecker::visitFrozenAttr(FrozenAttr *attr) {
 
   auto *VD = cast<ValueDecl>(D);
 
-  if (VD->getFormalAccess() < AccessLevel::Public &&
+  // @frozen attribute is allowed for public, package, or
+  // usableFromInline decls.
+  if (VD->getFormalAccess() < AccessLevel::Package &&
       !VD->getAttrs().hasAttribute<UsableFromInlineAttr>()) {
     diagnoseAndRemoveAttr(attr, diag::frozen_attr_on_internal_type,
                           VD->getName(), VD->getFormalAccess());
   }
 }
 
-/// Determine whether this is the main actor type.
-/// FIXME: the diagnostics engine and TypeCheckConcurrency both have a copy of
-///        this
-static bool isMainActor(NominalTypeDecl *nominal) {
-  return nominal->getName().is("MainActor") &&
-         nominal->getParentModule()->getName() ==
-             nominal->getASTContext().Id_Concurrency;
+static void checkGlobalActorAttr(
+    const Decl *decl,
+    std::pair<CustomAttr *, NominalTypeDecl *> &globalActorAttr) {
+  auto isolatedAttr = decl->getAttrs().getAttribute<IsolatedAttr>();
+  auto nonisolatedAttr = decl->getAttrs().getAttribute<NonisolatedAttr>();
+  auto executionAttr = decl->getAttrs().getAttribute<ExecutionAttr>();
+  struct NameAndRange {
+    StringRef name;
+    SourceRange range;
+
+    NameAndRange(StringRef _name, SourceRange _range)
+        : name(_name), range(_range) {}
+  };
+
+  llvm::SmallVector<NameAndRange, 4> attributes;
+
+  attributes.push_back(NameAndRange(globalActorAttr.second->getName().str(),
+                                    globalActorAttr.first->getRangeWithAt()));
+
+  if (isolatedAttr) {
+    attributes.push_back(NameAndRange(isolatedAttr->getAttrName(),
+                                      isolatedAttr->getRangeWithAt()));
+  }
+  if (nonisolatedAttr) {
+    attributes.push_back(NameAndRange(nonisolatedAttr->getAttrName(),
+                                      nonisolatedAttr->getRangeWithAt()));
+  }
+  if (executionAttr) {
+    attributes.push_back(NameAndRange(executionAttr->getAttrName(),
+                                      executionAttr->getRangeWithAt()));
+  }
+
+  if (attributes.size() == 1)
+    return;
+
+  if (attributes.size() == 2) {
+    decl->diagnose(diag::actor_isolation_multiple_attr_2, decl,
+                   attributes[0].name, attributes[1].name)
+        .highlight(attributes[0].range)
+        .highlight(attributes[1].range)
+        .warnUntilSwiftVersion(6)
+        .fixItRemove(attributes[1].range);
+    return;
+  }
+
+  if (attributes.size() == 3) {
+    decl->diagnose(diag::actor_isolation_multiple_attr_3, decl,
+                   attributes[0].name, attributes[1].name, attributes[2].name)
+        .highlight(attributes[0].range)
+        .highlight(attributes[1].range)
+        .highlight(attributes[2].range)
+        .warnUntilSwiftVersion(6)
+        .fixItRemove(attributes[1].range)
+        .fixItRemove(attributes[2].range);
+    return;
+  }
+
+  assert(attributes.size() == 4);
+  decl->diagnose(diag::actor_isolation_multiple_attr_4, decl,
+                 attributes[0].name, attributes[1].name, attributes[2].name,
+                 attributes[3].name)
+      .highlight(attributes[0].range)
+      .highlight(attributes[1].range)
+      .highlight(attributes[2].range)
+      .highlight(attributes[3].range)
+      .warnUntilSwiftVersion(6)
+      .fixItRemove(attributes[1].range)
+      .fixItRemove(attributes[2].range)
+      .fixItRemove(attributes[3].range);
 }
 
 void AttributeChecker::visitCustomAttr(CustomAttr *attr) {
   auto dc = D->getDeclContext();
 
   // Figure out which nominal declaration this custom attribute refers to.
-  auto found = evaluateOrDefault(
-    Ctx.evaluator, CustomAttrDeclRequest{attr, dc}, nullptr);
+  auto *nominal = evaluateOrDefault(
+    Ctx.evaluator, CustomAttrNominalRequest{attr, dc}, nullptr);
 
-  // FIXME: deal with macros.
-  NominalTypeDecl *nominal = nullptr;
-  if (found) {
-    // FIXME: Do full checking of the macro arguments here by turning it into
-    // a macro expansion expression (?).
-    if (found.is<MacroDecl *>())
+  if (!nominal) {
+    if (attr->isInvalid())
       return;
 
-    nominal = found.dyn_cast<NominalTypeDecl *>();
-  }
+    // Try resolving an attached macro attribute.
+    if (auto *macro = D->getResolvedMacro(attr)) {
+      for (auto *roleAttr : macro->getAttrs().getAttributes<MacroRoleAttr>()) {
+        auto role = roleAttr->getMacroRole();
+        if (isInvalidAttachedMacro(role, D)) {
+          diagnoseAndRemoveAttr(attr, diag::macro_attached_to_invalid_decl,
+                                getMacroRoleString(role),
+                                D->getDescriptiveKind(), D);
+        }
+      }
 
-  // Diagnose errors.
-  if (!found) {
+      return;
+    }
+
+    // Diagnose errors.
+
     auto typeRepr = attr->getTypeRepr();
 
     auto type = TypeResolution::forInterface(dc, TypeResolverContext::CustomAttr,
@@ -3597,9 +4501,15 @@ void AttributeChecker::visitCustomAttr(CustomAttr *attr) {
     return;
   }
 
-  if (isMainActor(nominal) && Ctx.LangOpts.isConcurrencyModelTaskToThread() &&
-      !AvailableAttr::isUnavailable(D)) {
-    Ctx.Diags.diagnose(attr->getLocation(),
+  if (nominal->isMainActor() && Ctx.LangOpts.isConcurrencyModelTaskToThread() &&
+      !D->isUnavailable()) {
+    SourceLoc loc;
+    if (attr->isImplicit()) {
+      loc = D->getStartLoc();
+    } else {
+      loc = attr->getLocation();
+    }
+    Ctx.Diags.diagnose(loc,
                        diag::concurrency_task_to_thread_model_main_actor,
                        "task-to-thread concurrency model");
     return;
@@ -3608,6 +4518,10 @@ void AttributeChecker::visitCustomAttr(CustomAttr *attr) {
   // If the nominal type is a property wrapper type, we can be delegating
   // through a property.
   if (nominal->getAttrs().hasAttribute<PropertyWrapperAttr>()) {
+    // FIXME: We shouldn't be type checking missing decls.
+    if (isa<MissingDecl>(D))
+      return;
+
     // property wrappers can only be applied to variables
     if (!isa<VarDecl>(D)) {
       diagnose(attr->getLocation(),
@@ -3629,88 +4543,6 @@ void AttributeChecker::visitCustomAttr(CustomAttr *attr) {
       }
     }
 
-    return;
-  }
-
-  if (nominal->getAttrs().hasAttribute<TypeWrapperAttr>()) {
-    if (!(isa<ClassDecl>(D) || isa<StructDecl>(D) || isa<ProtocolDecl>(D))) {
-      diagnose(attr->getLocation(),
-               diag::type_wrapper_attribute_not_allowed_here,
-               nominal->getName());
-      attr->setInvalid();
-      return;
-    }
-
-    return;
-  }
-
-  if (nominal->getAttrs().hasAttribute<RuntimeMetadataAttr>()) {
-    auto markInvalidApplication = [&]() {
-      diagnoseAndRemoveAttr(attr,
-                            diag::invalid_decl_for_runtime_discoverable_attr,
-                            nominal->getNameStr());
-    };
-
-    auto isGenericContext = [&](DeclContext *DC) {
-      return DC->isGenericContext() &&
-             !DC->getGenericSignatureOfContext()->areAllParamsConcrete();
-    };
-
-    // Any declaration in a local context is rejected.
-    if (dc->isLocalContext()) {
-      markInvalidApplication();
-      return;
-    }
-
-    switch (D->getKind()) {
-    case DeclKind::Class:
-    case DeclKind::Struct:
-    case DeclKind::Enum: {
-      auto *NTD = cast<NominalTypeDecl>(D);
-
-      // Non-generic types only.
-      if (isGenericContext(NTD))
-        break;
-
-      return;
-    }
-
-    case DeclKind::Protocol: {
-      // Allow on protocols because they are sources
-      // of inference.
-      return;
-    }
-
-    case DeclKind::Func: {
-      // Non-generic functions/methods only.
-      if (isGenericContext(cast<FuncDecl>(D)))
-        break;
-
-      // All non-generic and non-local functions are accepted.
-      return;
-    }
-
-    case DeclKind::Var: {
-      auto *var = cast<VarDecl>(D);
-
-      // `static` properties are not supported.
-      if (var->isStatic())
-        break;
-
-      // Instance properties of generic types are rejected.
-      if (isGenericContext(dc))
-        break;
-
-      return;
-    }
-
-    default:
-      // All other kinds of declarations i.e. subscripts, constructors etc.
-      // are unsupported.
-      break;
-    }
-
-    markInvalidApplication();
     return;
   }
 
@@ -3745,8 +4577,7 @@ void AttributeChecker::visitCustomAttr(CustomAttr *attr) {
         // Module interfaces don't print bodies for all getters, so allow getters
         // that don't have a body if we're compiling a module interface.
         // Within a protocol definition, there will never be a body.
-        SourceFile *parent = storage->getDeclContext()->getParentSourceFile();
-        bool isInInterface = parent && parent->Kind == SourceFileKind::Interface;
+        bool isInInterface = storage->getDeclContext()->isInSwiftinterface();
         if (!isInInterface && !getter->hasBody() &&
             !isa<ProtocolDecl>(storage->getDeclContext()))
           return true;
@@ -3798,7 +4629,11 @@ void AttributeChecker::visitCustomAttr(CustomAttr *attr) {
   // If the nominal type is a global actor, let the global actor attribute
   // retrieval request perform checking for us.
   if (nominal->isGlobalActor()) {
-    (void)D->getGlobalActorAttr();
+    diagnoseIsolatedDeinitInValueTypes(attr);
+    if (auto g = D->getGlobalActorAttr()) {
+      checkGlobalActorAttr(D, *g);
+    }
+
     if (auto value = dyn_cast<ValueDecl>(D)) {
       (void)getActorIsolation(value);
     } else {
@@ -3814,9 +4649,8 @@ void AttributeChecker::visitCustomAttr(CustomAttr *attr) {
     return;
   }
 
-  diagnose(attr->getLocation(), diag::nominal_type_not_attribute,
-           nominal->getDescriptiveKind(), nominal->getName());
-  nominal->diagnose(diag::decl_declared_here, nominal->getName());
+  diagnose(attr->getLocation(), diag::nominal_type_not_attribute, nominal);
+  nominal->diagnose(diag::decl_declared_here, nominal);
   attr->setInvalid();
 }
 
@@ -3835,455 +4669,25 @@ void AttributeChecker::visitPropertyWrapperAttr(PropertyWrapperAttr *attr) {
   (void)nominal->getPropertyWrapperTypeInfo();
 }
 
-void AttributeChecker::visitTypeWrapperAttr(TypeWrapperAttr *attr) {
-  auto isEnabled = [&]() {
-    if (Ctx.LangOpts.hasFeature(Feature::TypeWrappers))
-      return true;
-
-    // Accept attributes that come from swiftinterface files.
-    auto *parentSF = D->getDeclContext()->getParentSourceFile();
-    return parentSF && parentSF->Kind == SourceFileKind::Interface;
-  };
-
-  if (!isEnabled()) {
-    diagnose(attr->getLocation(), diag::type_wrappers_are_experimental);
-    attr->setInvalid();
-    return;
-  }
-
-  auto nominal = dyn_cast<NominalTypeDecl>(D);
-  if (!nominal)
-    return;
-
-  auto &ctx = D->getASTContext();
-
-  enum class UnviabilityReason {
-    Failable,
-    InvalidWrappedSelfType,
-    InvalidPropertyType,
-    InvalidStorageType,
-    Inaccessible
-  };
-
-  auto findMembersOrDiagnose = [&](DeclName memberName,
-                                   SmallVectorImpl<ValueDecl *> &results,
-                                   Diag<DeclName> notFoundDiagnostic) -> bool {
-    nominal->lookupQualified(nominal, DeclNameRef(memberName),
-                             NL_QualifiedDefault, results);
-
-    if (results.empty()) {
-      diagnose(nominal->getLoc(), notFoundDiagnostic, nominal->getName());
-      attr->setInvalid();
-      return true;
-    }
-    return false;
-  };
-
-  // Check whether type marked as @typeWrapper is valid:
-  //
-  // - Has two generic parameters - `Wrapped` and `Storage`
-  // - Has `init(for: <Wrapped>.Type, storage: <Storage>)`
-  // - Has at least one `subscript(storedKeyPath: KeyPath<...>)` overload
-
-  // Has a single generic parameter.
-  auto *genericParams = nominal->getGenericParams();
-  {
-    if (!genericParams || genericParams->size() != 2) {
-      diagnose(nominal->getLoc(),
-               diag::type_wrapper_requires_two_generic_params);
-      attr->setInvalid();
-      return;
-    }
-  }
-
-  // `init(for:storage:)`
-  {
-    DeclName initName(ctx, DeclBaseName::createConstructor(),
-                      {ctx.Id_for, ctx.Id_storage});
-
-    SmallVector<ValueDecl *, 2> inits;
-    if (findMembersOrDiagnose(initName, inits,
-                              diag::type_wrapper_requires_memberwise_init))
-      return;
-
-    llvm::SmallDenseMap<ConstructorDecl *, SmallVector<UnviabilityReason, 2>, 2>
-        nonViableInits;
-    for (auto *decl : inits) {
-      auto *init = cast<ConstructorDecl>(decl);
-
-      if (init->isFailable())
-        nonViableInits[init].push_back(UnviabilityReason::Failable);
-
-      if (isMemberLessAccessibleThanType(nominal, init))
-        nonViableInits[init].push_back(UnviabilityReason::Inaccessible);
-    }
-
-    unsigned numViable = inits.size() - nonViableInits.size();
-
-    switch (numViable) {
-    case 0: {
-      // If there are no viable initializers, let's complain.
-      for (const auto &entry : nonViableInits) {
-        auto *init = entry.first;
-
-        for (auto reason : entry.second) {
-          switch (reason) {
-          case UnviabilityReason::Failable:
-            diagnose(init, diag::type_wrapper_failable_init, init->getName());
-            break;
-
-          case UnviabilityReason::Inaccessible:
-            diagnose(init, diag::type_wrapper_type_requirement_not_accessible,
-                     init->getFormalAccess(), init->getDescriptiveKind(),
-                     init->getName(), nominal->getDeclaredType(),
-                     nominal->getFormalAccess());
-            break;
-
-          case UnviabilityReason::InvalidStorageType:
-          case UnviabilityReason::InvalidPropertyType:
-          case UnviabilityReason::InvalidWrappedSelfType:
-            llvm_unreachable("init(storage:) type is not checked");
-          }
-        }
-      }
-
-      attr->setInvalid();
-      return;
-    }
-
-    case 1: {
-      // If there is only one choice let's check whether it's correct.
-      for (auto *decl : inits) {
-        auto *ctor = cast<ConstructorDecl>(decl);
-
-        if (nonViableInits.count(ctor))
-          continue;
-
-        auto wrappedType = ctor->getParameters()->get(0)->getInterfaceType();
-        auto storageType = ctor->getParameters()->get(1)->getInterfaceType();
-
-        auto typeWrapperGenericParams = genericParams->getParams();
-
-        // Let's check wrapped type - it should be a metatype of the first
-        // generic parameter - <Wrapped>.
-        {
-          auto wrappedTypeParamTy =
-              typeWrapperGenericParams[0]->getInterfaceType();
-          if (!wrappedType->isEqual(wrappedTypeParamTy)) {
-            diagnose(
-                ctor,
-                diag::cannot_declare_type_wrapper_init_with_invalid_first_param,
-                wrappedTypeParamTy);
-            ctor->setInvalid();
-          }
-        }
-
-        // Second parameter should be <Storage> generic parameter type.
-        {
-          auto storageTypeParamTy = typeWrapperGenericParams[1]
-                                        ->getInterfaceType()
-                                        ->getMetatypeInstanceType();
-          if (!storageType->isEqual(storageTypeParamTy)) {
-            diagnose(
-                ctor,
-                diag::
-                    cannot_declare_type_wrapper_init_with_invalid_second_param,
-                storageTypeParamTy);
-            ctor->setInvalid();
-          }
-        }
-
-        if (ctor->isInvalid()) {
-          attr->setInvalid();
-          return;
-        }
-      }
-      break;
-    }
-
-    default:
-      diagnose(inits.front(), diag::cannot_overload_type_wrapper_initializer);
-      return;
-    }
-  }
-
-  // subscript([wrappedSelf: Wrapped], propertyKeyPath: KeyPath, storedKeypath:
-  // {Writable}KeyPath)
-  {
-    SmallVector<ValueDecl *, 2> subscripts;
-
-    // Let's try to find all of the required subscripts.
-    {
-      DeclName subscriptName(ctx, DeclBaseName::createSubscript(),
-                             {ctx.Id_propertyKeyPath, ctx.Id_storageKeyPath});
-
-      if (findMembersOrDiagnose(subscriptName, subscripts,
-                                diag::type_wrapper_requires_subscript))
-        return;
-    }
-
-    llvm::SmallDenseMap<SubscriptDecl *, SmallVector<UnviabilityReason, 2>, 2>
-        nonViableSubscripts;
-
-    bool hasReadOnly = false;
-    bool hasWritable = false;
-
-    auto hasKeyPathType = [](ParamDecl *PD) {
-      if (auto *BGT = PD->getInterfaceType()->getAs<BoundGenericType>()) {
-        return BGT->isKeyPath() || BGT->isWritableKeyPath() ||
-               BGT->isReferenceWritableKeyPath();
-      }
-      return false;
-    };
-
-    auto getPropertyKeyPathParamIndex =
-        [](SubscriptDecl *subscript) -> unsigned {
-      return subscript->getIndices()->size() == 2 ? 0 : 1;
-    };
-
-    auto getStorageKeyPathParamIndex =
-        [&](SubscriptDecl *subscript) -> unsigned {
-      return getPropertyKeyPathParamIndex(subscript) + 1;
-    };
-
-    auto diagnoseSubscript = [&](SubscriptDecl *subscript,
-                                 ArrayRef<UnviabilityReason> reasons) {
-      for (auto reason : reasons) {
-        switch (reason) {
-        case UnviabilityReason::InvalidWrappedSelfType: {
-          auto wrappedSelfExpectedTy =
-              genericParams->getParams()[0]->getDeclaredInterfaceType();
-          auto paramTy = subscript->getIndices()->get(0)->getInterfaceType();
-          diagnose(subscript,
-                   diag::type_wrapper_subscript_invalid_parameter_type,
-                   ctx.Id_wrappedSelf, wrappedSelfExpectedTy, paramTy);
-          break;
-        }
-
-        case UnviabilityReason::InvalidPropertyType: {
-          auto paramTy = subscript->getIndices()
-                             ->get(getPropertyKeyPathParamIndex(subscript))
-                             ->getInterfaceType();
-          diagnose(subscript,
-                   diag::type_wrapper_subscript_invalid_keypath_parameter,
-                   ctx.Id_propertyKeyPath, paramTy);
-          break;
-        }
-
-        case UnviabilityReason::InvalidStorageType: {
-          auto paramTy = subscript->getIndices()
-                             ->get(getStorageKeyPathParamIndex(subscript))
-                             ->getInterfaceType();
-          diagnose(subscript,
-                   diag::type_wrapper_subscript_invalid_keypath_parameter,
-                   ctx.Id_storageKeyPath, paramTy);
-          break;
-        }
-
-        case UnviabilityReason::Inaccessible:
-          diagnose(subscript,
-                   diag::type_wrapper_type_requirement_not_accessible,
-                   subscript->getFormalAccess(),
-                   subscript->getDescriptiveKind(), subscript->getName(),
-                   nominal->getDeclaredType(), nominal->getFormalAccess());
-          break;
-
-        case UnviabilityReason::Failable:
-          llvm_unreachable("subscripts cannot be failable");
-        }
-      }
-    };
-
-    for (auto *decl : subscripts) {
-      auto *subscript = cast<SubscriptDecl>(decl);
-
-      auto *indices = subscript->getIndices();
-
-      // Ignore `wrappedSelf`.
-      bool forReferenceType = indices->size() == 3;
-
-      if (forReferenceType) {
-        auto wrappedTypeParamTy =
-            genericParams->getParams()[0]->getDeclaredInterfaceType();
-
-        auto wrappedSelf = indices->get(0);
-        if (!wrappedSelf->getInterfaceType()->isEqual(wrappedTypeParamTy)) {
-          nonViableSubscripts[subscript].push_back(
-              UnviabilityReason::InvalidWrappedSelfType);
-        }
-      }
-
-      auto *propertyKeyPathParam =
-          indices->get(getPropertyKeyPathParamIndex(subscript));
-      {
-        if (!hasKeyPathType(propertyKeyPathParam)) {
-          nonViableSubscripts[subscript].push_back(
-              UnviabilityReason::InvalidPropertyType);
-        }
-      }
-
-      auto *storageKeyPathParam =
-          indices->get(getStorageKeyPathParamIndex(subscript));
-      {
-        if (hasKeyPathType(storageKeyPathParam)) {
-          auto type = storageKeyPathParam->getInterfaceType();
-          hasReadOnly |= type->isKeyPath();
-          hasWritable |=
-              type->isWritableKeyPath() || type->isReferenceWritableKeyPath();
-        } else {
-          nonViableSubscripts[subscript].push_back(
-              UnviabilityReason::InvalidStorageType);
-        }
-
-        if (isMemberLessAccessibleThanType(nominal, subscript))
-          nonViableSubscripts[subscript].push_back(
-              UnviabilityReason::Inaccessible);
-      }
-    }
-
-    if (!hasReadOnly) {
-      auto &DE = ctx.Diags;
-      DE.diagnoseWithNotes(
-          DE.diagnose(nominal->getLoc(),
-                      diag::type_wrapper_requires_readonly_subscript,
-                      nominal->getName()),
-          [&]() {
-            DE.diagnose(nominal->getLoc(),
-                        diag::add_type_wrapper_subscript_stub_note)
-                .fixItInsertAfter(
-                    nominal->getBraces().Start,
-                    "\nsubscript<Value>(propertyKeyPath propPath: "
-                    "KeyPath<<#WrappedType#>, Value>, storageKeyPath "
-                    "storagePath: KeyPath<<#Base#>, "
-                    "Value>) -> Value { get { <#code#> } }");
-          });
-      attr->setInvalid();
-    }
-
-    if (!hasWritable) {
-      auto &DE = ctx.Diags;
-      DE.diagnoseWithNotes(
-          DE.diagnose(nominal->getLoc(),
-                      diag::type_wrapper_requires_writable_subscript,
-                      nominal->getName()),
-          [&]() {
-            DE.diagnose(nominal->getLoc(),
-                        diag::add_type_wrapper_subscript_stub_note)
-                .fixItInsertAfter(
-                    nominal->getBraces().Start,
-                    "\nsubscript<Value>(propertyKeyPath propPath: "
-                    "KeyPath<<#WrappedType#>, Value>, storageKeyPath "
-                    "storagePath: "
-                    "WritableKeyPath<<#Base#>, "
-                    "Value>) -> Value { get { <#code#> } set { <#code#> } "
-                    "}");
-          });
-      attr->setInvalid();
-    }
-
-    if (subscripts.size() - nonViableSubscripts.size() == 0) {
-      for (const auto &entry : nonViableSubscripts) {
-        diagnoseSubscript(entry.first, entry.second);
-      }
-
-      attr->setInvalid();
-      return;
-    }
-
-    // If there were no issues with required subscripts, let's look
-    // for subscripts that are applicable only to reference types and
-    // diagnose them inline.
-    {
-      DeclName subscriptName(
-          ctx, DeclBaseName::createSubscript(),
-          {ctx.Id_wrappedSelf, ctx.Id_propertyKeyPath, ctx.Id_storageKeyPath});
-
-      for (auto *candidate : nominal->lookupDirect(subscriptName)) {
-        auto *subscript = cast<SubscriptDecl>(candidate);
-        auto *indices = subscript->getIndices();
-
-        auto wrappedTypeParamTy =
-            genericParams->getParams()[0]->getDeclaredInterfaceType();
-
-        auto wrappedSelf = indices->get(0);
-        if (!wrappedSelf->getInterfaceType()->isEqual(wrappedTypeParamTy)) {
-          diagnoseSubscript(subscript,
-                            UnviabilityReason::InvalidWrappedSelfType);
-        }
-
-        auto *propertyKeyPathParam =
-            indices->get(getPropertyKeyPathParamIndex(subscript));
-        if (!hasKeyPathType(propertyKeyPathParam))
-          diagnoseSubscript(subscript, UnviabilityReason::InvalidPropertyType);
-
-        auto *storageKeyPathParam =
-            indices->get(getStorageKeyPathParamIndex(subscript));
-        if (!hasKeyPathType(storageKeyPathParam))
-          diagnoseSubscript(subscript, UnviabilityReason::InvalidStorageType);
-
-        if (isMemberLessAccessibleThanType(nominal, subscript))
-          diagnoseSubscript(subscript, UnviabilityReason::Inaccessible);
-      }
-    }
-  }
-}
-
-void AttributeChecker::visitTypeWrapperIgnoredAttr(TypeWrapperIgnoredAttr *attr) {
-  auto *var = cast<VarDecl>(D);
-
-  // @typeWrapperIgnored applies only to properties that type wrapper can manage.
-  if (var->getDeclContext()->isLocalContext()) {
-    diagnoseAndRemoveAttr(attr, diag::type_wrapper_ignored_on_local_properties, attr);
-    return;
-  }
-
-  if (var->isLet()) {
-    diagnoseAndRemoveAttr(attr, diag::attr_only_one_decl_kind, attr, "var");
-    return;
-  }
-
-  if (var->getAttrs().hasAttribute<LazyAttr>()) {
-    diagnoseAndRemoveAttr(attr, diag::type_wrapper_ignored_on_lazy_properties, attr);
-    return;
-  }
-
-  if (var->isStatic()) {
-    diagnoseAndRemoveAttr(attr, diag::type_wrapper_ignored_on_static_properties, attr);
-    return;
-  }
-
-  // computed properties
-  {
-    SmallVector<AccessorKind, 4> accessors{AccessorKind::Get, AccessorKind::Set,
-                                           AccessorKind::Modify,
-                                           AccessorKind::MutableAddress};
-
-    if (llvm::any_of(accessors, [&var](const auto &accessor) {
-          return var->getParsedAccessor(accessor);
-        })) {
-      diagnoseAndRemoveAttr(
-          attr, diag::type_wrapper_ignored_on_computed_properties, attr);
-      return;
-    }
-  }
-}
-
 void AttributeChecker::visitResultBuilderAttr(ResultBuilderAttr *attr) {
   auto *nominal = dyn_cast<NominalTypeDecl>(D);
   auto &ctx = D->getASTContext();
-  SmallVector<ValueDecl *, 4> potentialMatches;
+  SmallVector<ValueDecl *, 4> buildBlockMatches;
+  SmallVector<ValueDecl *, 4> buildPartialBlockFirstMatches;
+  SmallVector<ValueDecl *, 4> buildPartialBlockAccumulatedMatches;
+
   bool supportsBuildBlock = TypeChecker::typeSupportsBuilderOp(
       nominal->getDeclaredType(), nominal, ctx.Id_buildBlock,
-      /*argLabels=*/{}, &potentialMatches);
+      /*argLabels=*/{}, &buildBlockMatches);
+
   bool supportsBuildPartialBlock =
       TypeChecker::typeSupportsBuilderOp(
-          nominal->getDeclaredType(), nominal,
-          ctx.Id_buildPartialBlock,
-          /*argLabels=*/{ctx.Id_first}, &potentialMatches) &&
+          nominal->getDeclaredType(), nominal, ctx.Id_buildPartialBlock,
+          /*argLabels=*/{ctx.Id_first}, &buildPartialBlockFirstMatches) &&
       TypeChecker::typeSupportsBuilderOp(
-          nominal->getDeclaredType(), nominal,
-          ctx.Id_buildPartialBlock,
-          /*argLabels=*/{ctx.Id_accumulated, ctx.Id_next}, &potentialMatches);
+          nominal->getDeclaredType(), nominal, ctx.Id_buildPartialBlock,
+          /*argLabels=*/{ctx.Id_accumulated, ctx.Id_next},
+          &buildPartialBlockAccumulatedMatches);
 
   if (!supportsBuildBlock && !supportsBuildPartialBlock) {
     {
@@ -4297,7 +4701,7 @@ void AttributeChecker::visitResultBuilderAttr(ResultBuilderAttr *attr) {
       Type componentType;
       std::tie(buildInsertionLoc, stubIndent, componentType) =
           determineResultBuilderBuildFixItInfo(nominal);
-      if (buildInsertionLoc.isValid() && potentialMatches.empty()) {
+      if (buildInsertionLoc.isValid() && buildBlockMatches.empty()) {
         std::string fixItString;
         {
           llvm::raw_string_ostream out(fixItString);
@@ -4313,7 +4717,7 @@ void AttributeChecker::visitResultBuilderAttr(ResultBuilderAttr *attr) {
 
     // For any close matches, attempt to explain to the user why they aren't
     // valid.
-    for (auto *member : potentialMatches) {
+    for (auto *member : buildBlockMatches) {
       if (member->isStatic() && isa<FuncDecl>(member))
         continue;
 
@@ -4326,6 +4730,70 @@ void AttributeChecker::visitResultBuilderAttr(ResultBuilderAttr *attr) {
       else
         diagnose(member->getLoc(),
                  diag::result_builder_buildblock_not_static_method);
+    }
+
+    return;
+  }
+
+  // Let's check whether one or more overloads of buildBlock or
+  // buildPartialBlock are as accessible as the builder type itself.
+  {
+    auto isBuildMethodAsAccessibleAsType = [&](ValueDecl *member) {
+      return !isMemberLessAccessibleThanType(nominal, member);
+    };
+
+    bool hasAccessibleBuildBlock =
+        llvm::any_of(buildBlockMatches, isBuildMethodAsAccessibleAsType);
+
+    bool hasAccessibleBuildPartialBlockFirst = false;
+    bool hasAccessibleBuildPartialBlockAccumulated = false;
+
+    if (supportsBuildPartialBlock) {
+      DeclName buildPartialBlockFirst(ctx, ctx.Id_buildPartialBlock,
+                                      /*argLabels=*/{ctx.Id_first});
+      DeclName buildPartialBlockAccumulated(
+          ctx, ctx.Id_buildPartialBlock,
+          /*argLabels=*/{ctx.Id_accumulated, ctx.Id_next});
+
+      buildPartialBlockFirstMatches.clear();
+      buildPartialBlockAccumulatedMatches.clear();
+
+      auto builderType = nominal->getDeclaredType();
+      nominal->lookupQualified(builderType, DeclNameRef(buildPartialBlockFirst),
+                               attr->getLocation(), NL_QualifiedDefault,
+                               buildPartialBlockFirstMatches);
+      nominal->lookupQualified(
+          builderType, DeclNameRef(buildPartialBlockAccumulated),
+          attr->getLocation(), NL_QualifiedDefault,
+          buildPartialBlockAccumulatedMatches);
+
+      hasAccessibleBuildPartialBlockFirst = llvm::any_of(
+          buildPartialBlockFirstMatches, isBuildMethodAsAccessibleAsType);
+      hasAccessibleBuildPartialBlockAccumulated = llvm::any_of(
+          buildPartialBlockAccumulatedMatches, isBuildMethodAsAccessibleAsType);
+    }
+
+    if (!hasAccessibleBuildBlock) {
+      // No or incomplete `buildPartialBlock` and all overloads of
+      // `buildBlock(_:)` are less accessible than the type.
+      if (!supportsBuildPartialBlock) {
+        diagnose(nominal->getLoc(),
+                 diag::result_builder_buildblock_not_accessible,
+                 nominal->getName(), nominal->getFormalAccess());
+      } else {
+        if (!hasAccessibleBuildPartialBlockFirst) {
+          diagnose(nominal->getLoc(),
+                   diag::result_builder_buildpartialblock_first_not_accessible,
+                   nominal->getName(), nominal->getFormalAccess());
+        }
+
+        if (!hasAccessibleBuildPartialBlockAccumulated) {
+          diagnose(
+              nominal->getLoc(),
+              diag::result_builder_buildpartialblock_accumulated_not_accessible,
+              nominal->getName(), nominal->getFormalAccess());
+        }
+      }
     }
   }
 }
@@ -4438,7 +4906,7 @@ void AttributeChecker::visitNonEphemeralAttr(NonEphemeralAttr *attr) {
   // ... or the protocol Self type.
   auto *outerDC = param->getDeclContext()->getParent();
   if (outerDC->getSelfProtocolDecl() &&
-      type->isEqual(outerDC->getProtocolSelfType())) {
+      type->isEqual(outerDC->getSelfInterfaceType())) {
     return;
   }
 
@@ -4492,15 +4960,68 @@ void AttributeChecker::checkOriginalDefinedInAttrs(
 void AttributeChecker::checkAvailableAttrs(ArrayRef<AvailableAttr *> Attrs) {
   if (Attrs.empty())
     return;
-  // If all available are spi available, we should use @_spi instead.
-  if (std::all_of(Attrs.begin(), Attrs.end(), [](AvailableAttr *AV) {
-    return AV->IsSPI;
-  })) {
-    diagnose(D->getLoc(), diag::spi_preferred_over_spi_available);
-  };
+
+  // Only diagnose top level decls since nested ones may have inherited availability.
+  if (!D->getDeclContext()->getInnermostDeclarationDeclContext()) {
+    // If all available are spi available, we should use @_spi instead.
+    if (std::all_of(Attrs.begin(), Attrs.end(), [](AvailableAttr *AV) {
+      return AV->isSPI();
+    })) {
+      diagnose(D->getLoc(), diag::spi_preferred_over_spi_available);
+    }
+  }
+
+  if (Ctx.LangOpts.DisableAvailabilityChecking)
+    return;
+
+  // Compute availability constraints for the decl, relative to its parent
+  // declaration or to the deployment target.
+  auto availabilityContext = AvailabilityContext::forDeploymentTarget(Ctx);
+  if (auto parent =
+          AvailabilityInference::parentDeclForInferredAvailability(D)) {
+    auto parentAvailability = TypeChecker::availabilityForDeclSignature(parent);
+    availabilityContext.constrainWithContext(parentAvailability, Ctx);
+  }
+
+  auto availabilityConstraint =
+      getAvailabilityConstraintsForDecl(D, availabilityContext)
+          .getPrimaryConstraint();
+  if (!availabilityConstraint)
+    return;
+
+  // If the decl is unavailable relative to its parent and it's not a
+  // declaration that is allowed to be unavailable, diagnose.
+  if (availabilityConstraint->isUnavailable()) {
+    auto attr = availabilityConstraint->getAttr();
+    if (auto diag = TypeChecker::diagnosticIfDeclCannotBeUnavailable(D)) {
+      diagnose(attr.getParsedAttr()->getLocation(), diag.value());
+      return;
+    }
+
+    if (auto *PD = dyn_cast<ProtocolDecl>(D->getDeclContext())) {
+      if (auto *VD = dyn_cast<ValueDecl>(D)) {
+        if (VD->isProtocolRequirement() && !PD->isObjC()) {
+          diagnoseAndRemoveAttr(
+              const_cast<AvailableAttr *>(attr.getParsedAttr()),
+              diag::unavailable_method_non_objc_protocol);
+          return;
+        }
+      }
+    }
+  }
+
+  // If the decl is potentially unavailable relative to its parent and it's
+  // not a declaration that is allowed to be potentially unavailable, diagnose.
+  if (availabilityConstraint->isPotentiallyAvailable()) {
+    auto attr = availabilityConstraint->getAttr();
+    if (auto diag =
+            TypeChecker::diagnosticIfDeclCannotBePotentiallyUnavailable(D))
+      diagnose(attr.getParsedAttr()->getLocation(), diag.value());
+  }
 }
 
-void AttributeChecker::checkBackDeployAttrs(ArrayRef<BackDeployAttr *> Attrs) {
+void AttributeChecker::checkBackDeployedAttrs(
+    ArrayRef<BackDeployedAttr *> Attrs) {
   if (Attrs.empty())
     return;
 
@@ -4510,19 +5031,13 @@ void AttributeChecker::checkBackDeployAttrs(ArrayRef<BackDeployAttr *> Attrs) {
   // back deployment, which is to use the ABI version of the declaration when it
   // is available.
   if (auto *AEICA = D->getAttrs().getAttribute<AlwaysEmitIntoClientAttr>()) {
-    diagnoseAndRemoveAttr(AEICA, diag::attr_incompatible_with_back_deploy,
-                          AEICA, D->getDescriptiveKind());
+    diagnoseAndRemoveAttr(AEICA, diag::attr_incompatible_with_back_deployed,
+                          AEICA, D);
   }
 
   if (auto *TA = D->getAttrs().getAttribute<TransparentAttr>()) {
-    diagnoseAndRemoveAttr(TA, diag::attr_incompatible_with_back_deploy, TA,
-                          D->getDescriptiveKind());
-  }
-
-  // @objc conflicts with back deployment since it implies dynamic dispatch.
-  if (auto *OA = D->getAttrs().getAttribute<ObjCAttr>()) {
-    diagnose(OA->getLocation(), diag::attr_incompatible_with_back_deploy, OA,
-             D->getDescriptiveKind());
+    diagnoseAndRemoveAttr(TA, diag::attr_incompatible_with_back_deployed, TA,
+                          D);
   }
 
   // Only functions, methods, computed properties, and subscripts are
@@ -4530,32 +5045,56 @@ void AttributeChecker::checkBackDeployAttrs(ArrayRef<BackDeployAttr *> Attrs) {
   auto *VD = cast<ValueDecl>(D);
   std::map<PlatformKind, SourceLoc> seenPlatforms;
 
-  auto *ActiveAttr = D->getAttrs().getBackDeploy(Ctx);
+  const BackDeployedAttr *ActiveAttr = nullptr;
+  if (D->getBackDeployedBeforeOSVersion(Ctx))
+    ActiveAttr = D->getAttrs().getBackDeployed(Ctx, false);
 
   for (auto *Attr : Attrs) {
     // Back deployment only makes sense for public declarations.
     if (diagnoseAndRemoveAttrIfDeclIsNonPublic(Attr, /*isError=*/true))
       continue;
 
-    // Back deployment isn't compatible with dynamic dispatch.
-    if (VD->isSyntacticallyOverridable()) {
+    if (isa<DestructorDecl>(D)) {
+      diagnoseAndRemoveAttr(Attr, diag::attr_invalid_on_decl_kind, Attr,
+                            D->getDescriptiveKind());
+      continue;
+    }
+
+    if (VD->isObjC()) {
+      diagnoseAndRemoveAttr(Attr, diag::attr_incompatible_with_objc, Attr,
+                            D->getDescriptiveKind());
+      continue;
+    }
+
+    // If the decl isn't effectively final then it could be invoked via dynamic
+    // dispatch.
+    if (D->isSyntacticallyOverridable()) {
       diagnose(Attr->getLocation(), diag::attr_incompatible_with_non_final,
                Attr, D->getDescriptiveKind());
       continue;
     }
 
-    if (auto *VarD = dyn_cast<VarDecl>(D)) {
-      // There must be a function body to back deploy so for vars we require
-      // that they be computed in order to allow back deployment.
-      if (VarD->hasStorageOrWrapsStorage()) {
-        diagnoseAndRemoveAttr(Attr, diag::attr_not_on_stored_properties, Attr);
+    // Some methods declared in classes aren't syntactically overridable but
+    // still may have vtable entries, implying dynamic dispatch.
+    if (auto *AFD = dyn_cast<AbstractFunctionDecl>(D)) {
+      if (isa<ClassDecl>(D->getDeclContext()) && AFD->needsNewVTableEntry()) {
+        diagnose(Attr->getLocation(), diag::attr_incompatible_with_non_final,
+                 Attr, D->getDescriptiveKind());
         continue;
       }
     }
 
-    if (isa<DestructorDecl>(D) || isa<ConstructorDecl>(D)) {
-      diagnoseAndRemoveAttr(Attr, diag::attr_invalid_on_decl_kind, Attr,
-                            D->getDescriptiveKind());
+    // If the decl is final but overrides another decl, that also indicates it
+    // could be invoked via dynamic dispatch.
+    if (VD->getOverriddenDecl()) {
+      diagnoseAndRemoveAttr(Attr, diag::attr_incompatible_with_override, Attr);
+      continue;
+    }
+
+    if (VD->getOpaqueResultTypeDecl()) {
+      diagnoseAndRemoveAttr(
+          Attr, diag::back_deployed_opaque_result_not_supported, Attr, VD)
+          .warnInSwiftInterface(D->getDeclContext());
       continue;
     }
 
@@ -4571,45 +5110,88 @@ void AttributeChecker::checkBackDeployAttrs(ArrayRef<BackDeployAttr *> Attrs) {
       continue;
     }
 
-    if (Ctx.LangOpts.DisableAvailabilityChecking)
-      continue;
-
-    // Availability conflicts can only be diagnosed for attributes that apply
-    // to the active platform.
+    // The remaining diagnostics can only be diagnosed for attributes that
+    // apply to the active platform.
     if (Attr != ActiveAttr)
       continue;
 
+    if (auto *VarD = dyn_cast<VarDecl>(D)) {
+      // There must be a function body to back deploy so for vars we require
+      // that they be computed in order to allow back deployment.
+      if (VarD->hasStorageOrWrapsStorage()) {
+        diagnoseAndRemoveAttr(Attr, diag::attr_not_on_stored_properties, Attr);
+        continue;
+      }
+    }
+
+    if (auto *AFD = dyn_cast<AbstractFunctionDecl>(D)) {
+      if (!AFD->hasBody()) {
+        diagnoseAndRemoveAttr(Attr, diag::back_deployed_requires_body, Attr,
+                              VD);
+        continue;
+      }
+    }
+
+    if (Ctx.LangOpts.DisableAvailabilityChecking)
+      continue;
+
+    auto availability = TypeChecker::availabilityAtLocation(
+        D->getLoc(), D->getInnermostDeclContext());
+
     // Unavailable decls cannot be back deployed.
-    if (auto unavailableAttrPair = VD->getSemanticUnavailableAttr()) {
-      auto unavailableAttr = unavailableAttrPair.value().first;
-      DeclName name;
-      unsigned accessorKind;
-      std::tie(accessorKind, name) = getAccessorKindAndNameForDiagnostics(VD);
-      diagnose(AtLoc, diag::attr_has_no_effect_on_unavailable_decl, Attr,
-               accessorKind, name, prettyPlatformString(Platform));
-      diagnose(unavailableAttr->AtLoc, diag::availability_marked_unavailable,
-               accessorKind, name)
-          .highlight(unavailableAttr->getRange());
+    auto backDeployedDomain = AvailabilityDomain::forPlatform(Attr->Platform);
+    if (auto unavailableDomain =
+            availability.containsUnavailableDomain(backDeployedDomain)) {
+      auto platformString = prettyPlatformString(Attr->Platform);
+      llvm::VersionTuple ignoredVersion;
+
+      AvailabilityInference::updateBeforePlatformForFallback(
+          Attr, Ctx, platformString, ignoredVersion);
+
+      diagnose(AtLoc, diag::attr_has_no_effect_on_unavailable_decl, Attr, VD,
+               platformString);
+
+      // Find the attribute that makes the declaration unavailable.
+      const Decl *attrDecl = D;
+      do {
+        if (auto unavailableAttr = attrDecl->getUnavailableAttr()) {
+          diagnose(unavailableAttr->getParsedAttr()->AtLoc,
+                   diag::availability_marked_unavailable, VD)
+              .highlight(unavailableAttr->getParsedAttr()->getRange());
+          break;
+        }
+
+        attrDecl =
+            AvailabilityInference::parentDeclForInferredAvailability(attrDecl);
+      } while (attrDecl);
+
       continue;
     }
 
     // Verify that the decl is available before the back deployment boundary.
     // If it's not, the attribute doesn't make sense since the back deployment
     // fallback could never be executed at runtime.
-    if (auto availableRangeAttrPair = VD->getSemanticAvailableRangeAttr()) {
+    if (auto availableRangeAttrPair =
+            getSemanticAvailableRangeDeclAndAttr(VD)) {
+      auto beforePlatformString = prettyPlatformString(Attr->Platform);
+      auto beforeVersion = Attr->Version;
       auto availableAttr = availableRangeAttrPair.value().first;
-      if (Attr->Version <= availableAttr->Introduced.value()) {
-        DeclName name;
-        unsigned accessorKind;
-        std::tie(accessorKind, name) = getAccessorKindAndNameForDiagnostics(VD);
+      auto introVersion = availableAttr.getIntroduced().value();
+      StringRef introPlatformString =
+          availableAttr.getDomain().getNameForDiagnostics();
+
+      AvailabilityInference::updateBeforePlatformForFallback(
+          Attr, Ctx, beforePlatformString, beforeVersion);
+      AvailabilityInference::updateIntroducedPlatformForFallback(
+          availableAttr, Ctx, introPlatformString, introVersion);
+
+      if (Attr->Version <= introVersion) {
         diagnose(AtLoc, diag::attr_has_no_effect_decl_not_available_before,
-                 Attr, accessorKind, name, prettyPlatformString(Platform),
-                 Attr->Version);
-        diagnose(availableAttr->AtLoc, diag::availability_introduced_in_version,
-                 accessorKind, name,
-                 prettyPlatformString(availableAttr->Platform),
-                 *availableAttr->Introduced)
-            .highlight(availableAttr->getRange());
+                 Attr, VD, beforePlatformString, beforeVersion);
+        diagnose(availableAttr.getParsedAttr()->AtLoc,
+                 diag::availability_introduced_in_version, VD,
+                 introPlatformString, introVersion)
+            .highlight(availableAttr.getParsedAttr()->getRange());
         continue;
       }
     }
@@ -4618,7 +5200,8 @@ void AttributeChecker::checkBackDeployAttrs(ArrayRef<BackDeployAttr *> Attrs) {
 
 Type TypeChecker::checkReferenceOwnershipAttr(VarDecl *var, Type type,
                                               ReferenceOwnershipAttr *attr) {
-  auto &Diags = var->getASTContext().Diags;
+  ASTContext &ctx = var->getASTContext();
+  auto &Diags = ctx.Diags;
   auto *dc = var->getDeclContext();
 
   // Don't check ownership attribute if the type is invalid.
@@ -4706,6 +5289,16 @@ Type TypeChecker::checkReferenceOwnershipAttr(VarDecl *var, Type type,
     attr->setInvalid();
   }
 
+  // Embedded Swift prohibits weak/unowned but allows unowned(unsafe).
+  if (ctx.LangOpts.hasFeature(Feature::Embedded)) {
+    if (ownershipKind == ReferenceOwnership::Weak ||
+        ownershipKind == ReferenceOwnership::Unowned) {
+      Diags.diagnose(attr->getLocation(), diag::weak_unowned_in_embedded_swift,
+               ownershipKind);
+      attr->setInvalid();
+    }
+  }
+
   if (attr->isInvalid())
     return type;
 
@@ -4713,13 +5306,23 @@ Type TypeChecker::checkReferenceOwnershipAttr(VarDecl *var, Type type,
   return ReferenceStorageType::get(type, ownershipKind, var->getASTContext());
 }
 
-Optional<Diag<>>
+std::optional<Diagnostic>
 TypeChecker::diagnosticIfDeclCannotBePotentiallyUnavailable(const Decl *D) {
   auto *DC = D->getDeclContext();
 
+  // A destructor is always called if declared.
+  if (isa<DestructorDecl>(D))
+    return Diagnostic(diag::availability_decl_no_potential, D);
+
+  // Observing accessors are always called implicitly.
+  if (auto *AD = dyn_cast<AccessorDecl>(D)) {
+    if (AD->isObservingAccessor())
+      return Diagnostic(diag::availability_decl_no_potential, D);
+  }
+
   if (auto *VD = dyn_cast<VarDecl>(D)) {
     if (!VD->hasStorageOrWrapsStorage())
-      return None;
+      return std::nullopt;
 
     // Do not permit potential availability of script-mode global variables;
     // their initializer expression is not lazily evaluated, so this would
@@ -4736,11 +5339,7 @@ TypeChecker::diagnosticIfDeclCannotBePotentiallyUnavailable(const Decl *D) {
     // An enum element with an associated value cannot be potentially
     // unavailable.
     if (EED->hasAssociatedValues()) {
-      auto &ctx = DC->getASTContext();
-      auto *SF = DC->getParentSourceFile();
-
-      if (SF->Kind == SourceFileKind::Interface ||
-          ctx.LangOpts.WarnOnPotentiallyUnavailableEnumCase) {
+      if (DC->isInSwiftinterface()) {
         return diag::availability_enum_element_no_potential_warn;
       } else {
         return diag::availability_enum_element_no_potential;
@@ -4748,12 +5347,65 @@ TypeChecker::diagnosticIfDeclCannotBePotentiallyUnavailable(const Decl *D) {
     }
   }
 
-  return None;
+  return std::nullopt;
+}
+
+std::optional<Diagnostic>
+TypeChecker::diagnosticIfDeclCannotBeUnavailable(const Decl *D) {
+  auto parentIsUnavailable = [](const Decl *D) -> bool {
+    if (auto *parent =
+            AvailabilityInference::parentDeclForInferredAvailability(D)) {
+      return parent->isSemanticallyUnavailable();
+    }
+    return false;
+  };
+
+  // A destructor is always called if declared.
+  if (isa<DestructorDecl>(D)) {
+    if (parentIsUnavailable(D))
+      return std::nullopt;
+
+    return Diagnostic(diag::availability_decl_no_unavailable, D);
+  }
+
+  // The conformance checker does not know what to do with unavailable
+  // associated types.
+  if (isa<AssociatedTypeDecl>(D))
+    return Diagnostic(diag::availability_decl_no_unavailable, D);
+
+  // Observing accessors are always called implicitly.
+  if (auto *AD = dyn_cast<AccessorDecl>(D)) {
+    if (AD->isObservingAccessor())
+      return Diagnostic(diag::availability_decl_no_unavailable, D);
+  }
+
+  if (auto *VD = dyn_cast<VarDecl>(D)) {
+    if (!VD->hasStorageOrWrapsStorage())
+      return std::nullopt;
+
+    if (parentIsUnavailable(D))
+      return std::nullopt;
+
+    // Be lenient in interfaces to accomodate @_spi_available.
+    if (D->getDeclContext()->isInSwiftinterface())
+      return std::nullopt;
+
+    // Do not permit unavailable script-mode global variables; their initializer
+    // expression is not lazily evaluated, so this would not be safe.
+    if (VD->isTopLevelGlobal())
+      return diag::availability_global_script_no_unavailable;
+
+    // Globals and statics are lazily initialized, so they are safe for
+    // unavailability.
+    if (!VD->isStatic() && !D->getDeclContext()->isModuleScopeContext())
+      return diag::availability_stored_property_no_unavailable;
+  }
+
+  return std::nullopt;
 }
 
 static bool shouldBlockImplicitDynamic(Decl *D) {
-  if (D->getAttrs().hasAttribute<NonObjCAttr>() ||
-      D->getAttrs().hasAttribute<SILGenNameAttr>() ||
+  if (D->getAttrs().hasAttribute<SILGenNameAttr>() ||
       D->getAttrs().hasAttribute<TransparentAttr>() ||
       D->getAttrs().hasAttribute<InlinableAttr>())
     return true;
@@ -4765,7 +5417,7 @@ void TypeChecker::addImplicitDynamicAttribute(Decl *D) {
 
   // Add the attribute if the decl kind allows it and it is not an accessor
   // decl. Accessor decls should always infer the var/subscript's attribute.
-  if (!DeclAttribute::canAttributeAppearOnDecl(DAK_Dynamic, D) ||
+  if (!DeclAttribute::canAttributeAppearOnDecl(DeclAttrKind::Dynamic, D) ||
       isa<AccessorDecl>(D))
     return;
 
@@ -4900,12 +5552,12 @@ SpecializeAttrTargetDeclRequest::evaluate(Evaluator &evaluator,
 /// Returns true if the given type conforms to `Differentiable` in the given
 /// context. If `tangentVectorEqualsSelf` is true, also check whether the given
 /// type satisfies `TangentVector == Self`.
-static bool conformsToDifferentiable(Type type, ModuleDecl *module,
+static bool conformsToDifferentiable(Type type,
                                      bool tangentVectorEqualsSelf = false) {
-  auto &ctx = module->getASTContext();
+  auto &ctx = type->getASTContext();
   auto *differentiableProto =
       ctx.getProtocol(KnownProtocolKind::Differentiable);
-  auto conf = TypeChecker::conformsToProtocol(type, differentiableProto, module);
+  auto conf = checkConformance(type, differentiableProto);
   if (conf.isInvalid())
     return false;
   if (!tangentVectorEqualsSelf)
@@ -4940,7 +5592,7 @@ IndexSubset *TypeChecker::inferDifferentiabilityParameters(
     if (paramType->isExistentialType())
       return false;
     // Return true if the type conforms to `Differentiable`.
-    return conformsToDifferentiable(paramType, module);
+    return conformsToDifferentiable(paramType);
   };
 
   // Get all parameter types.
@@ -4988,8 +5640,7 @@ static IndexSubset *computeDifferentiabilityParameters(
     // If function is not an instance method, diagnose immediately.
     if (!isInstanceMethod) {
       diags
-          .diagnose(attrLoc, diag::diff_function_no_parameters,
-                    function->getName())
+          .diagnose(attrLoc, diag::diff_function_no_parameters, function)
           .highlight(function->getSignatureSourceRange());
       return nullptr;
     }
@@ -5001,10 +5652,9 @@ static IndexSubset *computeDifferentiabilityParameters(
         selfType = derivativeGenEnv->mapTypeIntoContext(selfType);
       else
         selfType = function->mapTypeIntoContext(selfType);
-      if (!conformsToDifferentiable(selfType, module)) {
+      if (!conformsToDifferentiable(selfType)) {
         diags
-            .diagnose(attrLoc, diag::diff_function_no_parameters,
-                      function->getName())
+            .diagnose(attrLoc, diag::diff_function_no_parameters, function)
             .highlight(function->getSignatureSourceRange());
         return nullptr;
       }
@@ -5092,12 +5742,15 @@ static IndexSubset *computeDifferentiabilityParameters(
 static DescriptiveDeclKind getAccessorDescriptiveDeclKind(AccessorKind kind) {
   switch (kind) {
   case AccessorKind::Get:
+  case AccessorKind::DistributedGet:
     return DescriptiveDeclKind::Getter;
   case AccessorKind::Set:
     return DescriptiveDeclKind::Setter;
   case AccessorKind::Read:
+  case AccessorKind::Read2:
     return DescriptiveDeclKind::ReadAccessor;
   case AccessorKind::Modify:
+  case AccessorKind::Modify2:
     return DescriptiveDeclKind::ModifyAccessor;
   case AccessorKind::WillSet:
     return DescriptiveDeclKind::WillSet;
@@ -5107,6 +5760,8 @@ static DescriptiveDeclKind getAccessorDescriptiveDeclKind(AccessorKind kind) {
     return DescriptiveDeclKind::Addressor;
   case AccessorKind::MutableAddress:
     return DescriptiveDeclKind::MutableAddressor;
+  case AccessorKind::Init:
+    return DescriptiveDeclKind::InitAccessor;
   }
 }
 
@@ -5145,9 +5800,10 @@ enum class AbstractFunctionDeclLookupErrorKind {
 /// Used for resolving the referenced declaration in `@derivative` and
 /// `@transpose` attributes.
 static AbstractFunctionDecl *findAutoDiffOriginalFunctionDecl(
-    DeclAttribute *attr, Type baseType, DeclNameRefWithLoc funcNameWithLoc,
-    DeclContext *lookupContext, NameLookupOptions lookupOptions,
-    const llvm::function_ref<Optional<AbstractFunctionDeclLookupErrorKind>(
+    DeclAttribute *attr, Type baseType,
+    const DeclNameRefWithLoc &funcNameWithLoc, DeclContext *lookupContext,
+    NameLookupOptions lookupOptions,
+    const llvm::function_ref<std::optional<AbstractFunctionDeclLookupErrorKind>(
         AbstractFunctionDecl *)> &isValidCandidate,
     AnyFunctionType *expectedOriginalFnType) {
   assert(lookupContext);
@@ -5165,7 +5821,8 @@ static AbstractFunctionDecl *findAutoDiffOriginalFunctionDecl(
   if (!baseType && lookupContext->isTypeContext())
     baseType = lookupContext->getSelfTypeInContext();
   if (baseType) {
-    results = TypeChecker::lookupMember(lookupContext, baseType, funcName);
+    if (!baseType->hasError())
+      results = TypeChecker::lookupMember(lookupContext, baseType, funcName);
   } else {
     results = TypeChecker::lookupUnqualified(
         lookupContext, funcName, funcNameLoc.getBaseNameLoc(), lookupOptions);
@@ -5524,49 +6181,6 @@ getTransposeOriginalFunctionType(AnyFunctionType *transposeFnType,
   return originalType;
 }
 
-/// Given a `@differentiable` attribute, attempts to resolve the original
-/// `AbstractFunctionDecl` for which it is registered, using the declaration
-/// on which it is actually declared. On error, emits diagnostic and returns
-/// `nullptr`.
-AbstractFunctionDecl *
-resolveDifferentiableAttrOriginalFunction(DifferentiableAttr *attr) {
-  auto *D = attr->getOriginalDeclaration();
-  assert(D &&
-         "Original declaration should be resolved by parsing/deserialization");
-  auto *original = dyn_cast<AbstractFunctionDecl>(D);
-  if (auto *asd = dyn_cast<AbstractStorageDecl>(D)) {
-    // If `@differentiable` attribute is declared directly on a
-    // `AbstractStorageDecl` (a stored/computed property or subscript),
-    // forward the attribute to the storage's getter.
-    // TODO(TF-129): Forward `@differentiable` attributes to setters after
-    // differentiation supports inout parameters.
-    // TODO(TF-1080): Forward `@differentiable` attributes to `read` and
-    // `modify` accessors after differentiation supports `inout` parameters.
-    if (!asd->getDeclContext()->isModuleScopeContext()) {
-      original = asd->getSynthesizedAccessor(AccessorKind::Get);
-    } else {
-      original = nullptr;
-    }
-  }
-  // Non-`get` accessors are not yet supported: `set`, `read`, and `modify`.
-  // TODO(TF-1080): Enable `read` and `modify` when differentiation supports
-  // coroutines.
-  if (auto *accessor = dyn_cast_or_null<AccessorDecl>(original))
-    if (!accessor->isGetter() && !accessor->isSetter())
-      original = nullptr;
-  // Diagnose if original `AbstractFunctionDecl` could not be resolved.
-  if (!original) {
-    diagnoseAndRemoveAttr(D, attr, diag::invalid_decl_attribute, attr);
-    attr->setInvalid();
-    return nullptr;
-  }
-  // If the original function has an error interface type, return.
-  // A diagnostic should have already been emitted.
-  if (original->getInterfaceType()->hasError())
-    return nullptr;
-  return original;
-}
-
 /// Given a `@differentiable` attribute, attempts to resolve the derivative
 /// generic signature. The derivative generic signature is returned as
 /// `derivativeGenSig`. On error, emits diagnostic, assigns `nullptr` to
@@ -5620,7 +6234,7 @@ bool resolveDifferentiableAttrDerivativeGenericSignature(
           .diagnose(
               attr->getLocation(),
               diag::differentiable_attr_where_clause_for_nongeneric_original,
-              original->getName())
+              original)
           .highlight(whereClause->getSourceRange());
       attr->setInvalid();
       return true;
@@ -5632,7 +6246,9 @@ bool resolveDifferentiableAttrDerivativeGenericSignature(
         WhereClauseOwner(original, attr),
         /*addedRequirements=*/{},
         /*inferenceSources=*/{},
-        /*allowConcreteParams=*/true};
+        attr->getLocation(),
+        /*forExtension=*/nullptr,
+        /*allowInverses=*/true};
 
     // Compute generic signature for derivative functions.
     derivativeGenSig = evaluateOrDefault(ctx.evaluator, request,
@@ -5691,7 +6307,7 @@ bool resolveDifferentiableAttrDifferentiabilityParameters(
   auto expectedLinearMapTypeOrError =
       originalFnRemappedTy->getAutoDiffDerivativeFunctionLinearMapType(
           diffParamIndices, AutoDiffLinearMapKind::Differential,
-          LookUpConformanceInModule(original->getModuleContext()),
+          LookUpConformanceInModule(),
           /*makeSelfParamFirst*/ true);
 
   // Helper for diagnosing derivative function type errors.
@@ -5703,12 +6319,6 @@ bool resolveDifferentiableAttrDifferentiabilityParameters(
           .diagnose(attr->getLocation(),
                     diag::autodiff_attr_original_void_result,
                     original->getName())
-          .highlight(original->getSourceRange());
-      return;
-    case DerivativeFunctionTypeError::Kind::MultipleSemanticResults:
-      diags
-          .diagnose(attr->getLocation(),
-                    diag::autodiff_attr_original_multiple_semantic_results)
           .highlight(original->getSourceRange());
       return;
     case DerivativeFunctionTypeError::Kind::NoDifferentiabilityParameters:
@@ -5745,11 +6355,11 @@ bool resolveDifferentiableAttrDifferentiabilityParameters(
 
 /// Checks whether differentiable programming is enabled for the given
 /// differentiation-related attribute. Returns true on error.
-bool checkIfDifferentiableProgrammingEnabled(ASTContext &ctx,
-                                             DeclAttribute *attr,
-                                             DeclContext *DC) {
+static bool checkIfDifferentiableProgrammingEnabled(DeclAttribute *attr,
+                                                    Decl *D) {
+  auto &ctx = D->getASTContext();
   auto &diags = ctx.Diags;
-  auto *SF = DC->getParentSourceFile();
+  auto *SF = D->getDeclContext()->getParentSourceFile();
   assert(SF && "Source file not found");
   // The `Differentiable` protocol must be available.
   // If unavailable, the `_Differentiation` module should be imported.
@@ -5762,34 +6372,39 @@ bool checkIfDifferentiableProgrammingEnabled(ASTContext &ctx,
   return true;
 }
 
-IndexSubset *DifferentiableAttributeTypeCheckRequest::evaluate(
-    Evaluator &evaluator, DifferentiableAttr *attr) const {
-  // Skip type-checking for implicit `@differentiable` attributes. We currently
-  // assume that all implicit `@differentiable` attributes are valid.
-  //
-  // Motivation: some implicit attributes do not have a `where` clause, and this
-  // function assumes that the `where` clauses exist. Propagating `where`
-  // clauses and requirements consistently is a larger problem, to be revisited.
-  if (attr->isImplicit())
+static IndexSubset *
+resolveDiffParamIndices(AbstractFunctionDecl *original,
+                        DifferentiableAttr *attr,
+                        GenericSignature derivativeGenSig) {
+  auto *derivativeGenEnv = derivativeGenSig.getGenericEnvironment();
+
+  // Compute the derivative function type.
+  auto originalFnRemappedTy = original->getInterfaceType()->castTo<AnyFunctionType>();
+  if (derivativeGenEnv)
+    originalFnRemappedTy =
+        derivativeGenEnv->mapTypeIntoContext(originalFnRemappedTy)
+            ->castTo<AnyFunctionType>();
+
+  // Resolve and validate the differentiability parameters.
+  IndexSubset *resolvedDiffParamIndices = nullptr;
+  if (resolveDifferentiableAttrDifferentiabilityParameters(
+        attr, original, originalFnRemappedTy, derivativeGenEnv,
+        resolvedDiffParamIndices))
     return nullptr;
 
-  auto *D = attr->getOriginalDeclaration();
-  auto &ctx = D->getASTContext();
+  return resolvedDiffParamIndices;
+}
+
+
+static IndexSubset *
+typecheckDifferentiableAttrforDecl(AbstractFunctionDecl *original,
+                                   DifferentiableAttr *attr,
+                                   IndexSubset *resolvedDiffParamIndices = nullptr) {
+  auto &ctx = original->getASTContext();
   auto &diags = ctx.Diags;
-  // `@differentiable` attribute requires experimental differentiable
-  // programming to be enabled.
-  if (checkIfDifferentiableProgrammingEnabled(ctx, attr, D->getDeclContext()))
-    return nullptr;
-
-  // Resolve the original `AbstractFunctionDecl`.
-  auto *original = resolveDifferentiableAttrOriginalFunction(attr);
-  if (!original)
-    return nullptr;
-
-  auto *originalFnTy = original->getInterfaceType()->castTo<AnyFunctionType>();
 
   // Diagnose if original function has opaque result types.
-  if (auto *opaqueResultTypeDecl = original->getOpaqueResultTypeDecl()) {
+  if (original->getOpaqueResultTypeDecl()) {
     diags.diagnose(
         attr->getLocation(),
         diag::autodiff_attr_opaque_result_type_unsupported);
@@ -5833,67 +6448,175 @@ IndexSubset *DifferentiableAttributeTypeCheckRequest::evaluate(
   }
 
   // Resolve the derivative generic signature.
-  GenericSignature derivativeGenSig = nullptr;
-  if (resolveDifferentiableAttrDerivativeGenericSignature(attr, original,
+  GenericSignature derivativeGenSig = attr->getDerivativeGenericSignature();
+  if (!derivativeGenSig &&
+      resolveDifferentiableAttrDerivativeGenericSignature(attr, original,
                                                           derivativeGenSig))
     return nullptr;
-  auto *derivativeGenEnv = derivativeGenSig.getGenericEnvironment();
-
-  // Compute the derivative function type.
-  auto originalFnRemappedTy = originalFnTy;
-  if (derivativeGenEnv)
-    originalFnRemappedTy =
-        derivativeGenEnv->mapTypeIntoContext(originalFnRemappedTy)
-            ->castTo<AnyFunctionType>();
 
   // Resolve and validate the differentiability parameters.
-  IndexSubset *resolvedDiffParamIndices = nullptr;
-  if (resolveDifferentiableAttrDifferentiabilityParameters(
-          attr, original, originalFnRemappedTy, derivativeGenEnv,
-          resolvedDiffParamIndices))
+  if (!resolvedDiffParamIndices)
+    resolvedDiffParamIndices = resolveDiffParamIndices(original, attr,
+                                                       derivativeGenSig);
+  if (!resolvedDiffParamIndices)
     return nullptr;
 
-  if (auto *asd = dyn_cast<AbstractStorageDecl>(D)) {
-    // Remove `@differentiable` attribute from storage declaration to prevent
-    // duplicate attribute registration during SILGen.
-    D->getAttrs().removeAttribute(attr);
-    // Transfer `@differentiable` attribute from storage declaration to
-    // getter accessor.
-    auto *getterDecl = asd->getOpaqueAccessor(AccessorKind::Get);
-    auto *newAttr = DifferentiableAttr::create(
-        getterDecl, /*implicit*/ true, attr->AtLoc, attr->getRange(),
-        attr->getDifferentiabilityKind(), resolvedDiffParamIndices,
-        attr->getDerivativeGenericSignature());
-    auto insertion = ctx.DifferentiableAttrs.try_emplace(
-        {getterDecl, resolvedDiffParamIndices}, newAttr);
-    // Reject duplicate `@differentiable` attributes.
-    if (!insertion.second) {
-      diagnoseAndRemoveAttr(D, attr, diag::differentiable_attr_duplicate);
-      diags.diagnose(insertion.first->getSecond()->getLocation(),
-                     diag::differentiable_attr_duplicate_note);
-      return nullptr;
-    }
-    getterDecl->getAttrs().add(newAttr);
-    // Register derivative function configuration.
-    auto *resultIndices = IndexSubset::get(ctx, 1, {0});
-    getterDecl->addDerivativeFunctionConfiguration(
-        {resolvedDiffParamIndices, resultIndices, derivativeGenSig});
-    return resolvedDiffParamIndices;
-  }
   // Reject duplicate `@differentiable` attributes.
   auto insertion =
-      ctx.DifferentiableAttrs.try_emplace({D, resolvedDiffParamIndices}, attr);
+      ctx.DifferentiableAttrs.try_emplace({original, resolvedDiffParamIndices}, attr);
   if (!insertion.second && insertion.first->getSecond() != attr) {
-    diagnoseAndRemoveAttr(D, attr, diag::differentiable_attr_duplicate);
+    diagnoseAndRemoveAttr(original, attr, diag::differentiable_attr_duplicate);
     diags.diagnose(insertion.first->getSecond()->getLocation(),
                    diag::differentiable_attr_duplicate_note);
     return nullptr;
   }
+
   // Register derivative function configuration.
-  auto *resultIndices = IndexSubset::get(ctx, 1, {0});
+  SmallVector<AutoDiffSemanticFunctionResultType, 1> semanticResults;
+
+  // Compute the derivative function type.
+  auto originalFnRemappedTy = original->getInterfaceType()->castTo<AnyFunctionType>();
+  if (auto *derivativeGenEnv = derivativeGenSig.getGenericEnvironment())
+    originalFnRemappedTy =
+        derivativeGenEnv->mapTypeIntoContext(originalFnRemappedTy)
+            ->castTo<AnyFunctionType>();
+  
+  auto *resultIndices =
+    autodiff::getFunctionSemanticResultIndices(originalFnRemappedTy,
+                                               resolvedDiffParamIndices);
+
   original->addDerivativeFunctionConfiguration(
       {resolvedDiffParamIndices, resultIndices, derivativeGenSig});
   return resolvedDiffParamIndices;
+}
+
+/// Given a `@differentiable` attribute, attempts to resolve the original
+/// `AbstractFunctionDecl` for which it is registered, using the declaration
+/// on which it is actually declared. On error, emits diagnostic and returns
+/// `nullptr`.
+static AbstractFunctionDecl *
+resolveDifferentiableAttrOriginalFunction(DifferentiableAttr *attr) {
+  auto *D = attr->getOriginalDeclaration();
+  auto *original = dyn_cast<AbstractFunctionDecl>(D);
+
+  // Non-`get`/`set` accessors are not yet supported: `read`, and `modify`.
+  // TODO(TF-1080): Enable `read` and `modify` when differentiation supports
+  // coroutines.
+  if (auto *accessor = dyn_cast_or_null<AccessorDecl>(original))
+    if (!accessor->isGetter() && !accessor->isSetter())
+      original = nullptr;
+
+  // Diagnose if original `AbstractFunctionDecl` could not be resolved.
+  if (!original) {
+    diagnoseAndRemoveAttr(D, attr, diag::invalid_decl_attribute, attr);
+    attr->setInvalid();
+    return nullptr;
+  }
+
+  // If the original function has an error interface type, return.
+  // A diagnostic should have already been emitted.
+  if (original->getInterfaceType()->hasError())
+    return nullptr;
+
+  return original;
+}
+
+static IndexSubset *
+resolveDifferentiableAccessors(DifferentiableAttr *attr,
+                               AbstractStorageDecl *asd) {
+  auto typecheckAccessor = [&](AccessorDecl *ad) -> IndexSubset* {
+    GenericSignature derivativeGenSig = nullptr;
+    if (resolveDifferentiableAttrDerivativeGenericSignature(attr, ad,
+                                                            derivativeGenSig))
+      return nullptr;
+
+    IndexSubset *resolvedDiffParamIndices = resolveDiffParamIndices(ad, attr,
+                                                                    derivativeGenSig);
+    if (!resolvedDiffParamIndices)
+      return nullptr;
+
+    auto *newAttr = DifferentiableAttr::create(
+      ad, /*implicit*/ true, attr->AtLoc, attr->getRange(),
+      attr->getDifferentiabilityKind(), resolvedDiffParamIndices,
+      attr->getDerivativeGenericSignature());
+    ad->getAttrs().add(newAttr);
+
+    if (!typecheckDifferentiableAttrforDecl(ad, attr,
+                                            resolvedDiffParamIndices))
+      return nullptr;
+
+    return resolvedDiffParamIndices;
+  };
+
+  // No getters / setters for global variables
+  if (asd->getDeclContext()->isModuleScopeContext()) {
+    diagnoseAndRemoveAttr(asd, attr, diag::invalid_decl_attribute, attr);
+    attr->setInvalid();
+    return nullptr;
+  }
+
+  if (!typecheckAccessor(asd->getSynthesizedAccessor(AccessorKind::Get)))
+    return nullptr;
+
+  if (asd->supportsMutation()) {
+    // FIXME: Class-typed values have reference semantics and can be freely
+    // mutated. Thus, they should be treated like inout parameters for the
+    // purposes of @differentiable and @derivative type-checking.  Until
+    // https://github.com/apple/swift/issues/55542 is fixed, check if setter has
+    // computed semantic results and do not typecheck if they are none
+    // (class-typed `self' parameter is not treated as a "semantic result"
+    // currently)
+    if (!asd->getDeclContext()->getSelfClassDecl())
+      if (!typecheckAccessor(asd->getSynthesizedAccessor(AccessorKind::Set)))
+        return nullptr;
+  }
+
+  // Remove `@differentiable` attribute from storage declaration to prevent
+  // duplicate attribute registration during SILGen.
+  asd->getAttrs().removeAttribute(attr);
+
+  // Here we are effectively removing attribute from original decl, therefore no
+  // index subset for us
+  return nullptr;
+}
+
+
+IndexSubset *DifferentiableAttributeTypeCheckRequest::evaluate(
+    Evaluator &evaluator, DifferentiableAttr *attr) const {
+  // Skip type-checking for implicit `@differentiable` attributes. We currently
+  // assume that all implicit `@differentiable` attributes are valid.
+  //
+  // Motivation: some implicit attributes do not have a `where` clause, and this
+  // function assumes that the `where` clauses exist. Propagating `where`
+  // clauses and requirements consistently is a larger problem, to be revisited.
+  if (attr->isImplicit())
+    return nullptr;
+
+  auto *D = attr->getOriginalDeclaration();
+  assert(D &&
+         "Original declaration should be resolved by parsing/deserialization");
+
+  // `@differentiable` attribute requires experimental differentiable
+  // programming to be enabled.
+  if (checkIfDifferentiableProgrammingEnabled(attr, D)) {
+    attr->setInvalid();
+    return nullptr;
+  }
+
+  // If `@differentiable` attribute is declared directly on a
+  // `AbstractStorageDecl` (a stored/computed property or subscript),
+  // forward the attribute to the storage's getter / setter
+  if (auto *asd = dyn_cast<AbstractStorageDecl>(D))
+    return resolveDifferentiableAccessors(attr, asd);
+
+  // Resolve the original `AbstractFunctionDecl`.
+  auto *original = resolveDifferentiableAttrOriginalFunction(attr);
+  if (!original) {
+    attr->setInvalid();
+    return nullptr;
+  }
+
+  return typecheckDifferentiableAttrforDecl(original, attr);
 }
 
 void AttributeChecker::visitDifferentiableAttr(DifferentiableAttr *attr) {
@@ -5918,7 +6641,7 @@ static bool typeCheckDerivativeAttr(DerivativeAttr *attr) {
   auto &diags = Ctx.Diags;
   // `@derivative` attribute requires experimental differentiable programming
   // to be enabled.
-  if (checkIfDifferentiableProgrammingEnabled(Ctx, attr, D->getDeclContext()))
+  if (checkIfDifferentiableProgrammingEnabled(attr, D))
     return true;
   auto *derivative = cast<FuncDecl>(D);
   auto originalName = attr->getOriginalFunctionName();
@@ -5982,7 +6705,7 @@ static bool typeCheckDerivativeAttr(DerivativeAttr *attr) {
   };
 
   auto isValidOriginalCandidate = [&](AbstractFunctionDecl *originalCandidate)
-      -> Optional<AbstractFunctionDeclLookupErrorKind> {
+      -> std::optional<AbstractFunctionDeclLookupErrorKind> {
     // Error if the original candidate is a protocol requirement. Derivative
     // registration does not yet support protocol requirements.
     // TODO(TF-982): Allow default derivative implementations for protocol
@@ -5998,13 +6721,13 @@ static bool typeCheckDerivativeAttr(DerivativeAttr *attr) {
             cast<AnyFunctionType>(originalFnType->getCanonicalType()),
             originalCandidate->getInterfaceType()->getCanonicalType()))
       return AbstractFunctionDeclLookupErrorKind::CandidateTypeMismatch;
-    return None;
+    return std::nullopt;
   };
 
   Type baseType;
   if (auto *baseTypeRepr = attr->getBaseTypeRepr()) {
     const auto options =
-        TypeResolutionOptions(None) | TypeResolutionFlags::AllowModule;
+        TypeResolutionOptions(std::nullopt) | TypeResolutionFlags::AllowModule;
     baseType = TypeResolution::resolveContextualType(
         baseTypeRepr, derivative->getDeclContext(), options,
         /*unboundTyOpener*/ nullptr,
@@ -6053,8 +6776,7 @@ static bool typeCheckDerivativeAttr(DerivativeAttr *attr) {
       diags.diagnose(originalName.Loc,
                      diag::derivative_attr_original_stored_property_unsupported,
                      originalName.Name);
-      diags.diagnose(originalAFD->getLoc(), diag::decl_declared_here,
-                     asd->getName());
+      diags.diagnose(originalAFD->getLoc(), diag::decl_declared_here, asd);
       return true;
     }
     // Diagnose original class property and subscript setters.
@@ -6063,14 +6785,13 @@ static bool typeCheckDerivativeAttr(DerivativeAttr *attr) {
         accessorDecl->getAccessorKind() == AccessorKind::Set) {
       diags.diagnose(originalName.Loc,
                      diag::derivative_attr_class_setter_unsupported);
-      diags.diagnose(originalAFD->getLoc(), diag::decl_declared_here,
-                     asd->getName());
+      diags.diagnose(originalAFD->getLoc(), diag::decl_declared_here, asd);
       return true;
     }
   }
 
   // Diagnose if original function has opaque result types.
-  if (auto *opaqueResultTypeDecl = originalAFD->getOpaqueResultTypeDecl()) {
+  if (originalAFD->getOpaqueResultTypeDecl()) {
     diags.diagnose(
         attr->getLocation(),
         diag::autodiff_attr_opaque_result_type_unsupported);
@@ -6129,16 +6850,15 @@ static bool typeCheckDerivativeAttr(DerivativeAttr *attr) {
     diags
         .diagnose(attr->getOriginalFunctionName().Loc.getBaseNameLoc(),
                   diag::derivative_attr_static_method_mismatch_original,
-                  originalAFD->getName(), derivative->getName(),
-                  derivativeMustBeStatic)
+                  originalAFD, derivative, derivativeMustBeStatic)
         .highlight(attr->getOriginalFunctionName().Loc.getSourceRange());
     diags.diagnose(originalAFD->getNameLoc(),
                    diag::derivative_attr_static_method_mismatch_original_note,
-                   originalAFD->getName(), derivativeMustBeStatic);
+                   originalAFD, derivativeMustBeStatic);
     auto fixItDiag =
         diags.diagnose(derivative->getStartLoc(),
                        diag::derivative_attr_static_method_mismatch_fix,
-                       derivative->getName(), derivativeMustBeStatic);
+                       derivative, derivativeMustBeStatic);
     if (derivativeMustBeStatic) {
       fixItDiag.fixItInsert(derivative->getStartLoc(), "static ");
     } else {
@@ -6166,8 +6886,8 @@ static bool typeCheckDerivativeAttr(DerivativeAttr *attr) {
         derivative->getFormalAccessScope().accessLevelForDiagnostics();
     diags.diagnose(originalName.Loc,
                    diag::derivative_attr_access_level_mismatch,
-                   originalAFD->getName(), originalAccess,
-                   derivative->getName(), derivativeAccess);
+                   originalAFD, originalAccess,
+                   derivative, derivativeAccess);
     auto fixItDiag =
         derivative->diagnose(diag::derivative_attr_fix_access, originalAccess);
     // If original access is public, suggest adding `@usableFromInline` to
@@ -6209,7 +6929,7 @@ static bool typeCheckDerivativeAttr(DerivativeAttr *attr) {
   auto expectedLinearMapTypeOrError =
       originalFnType->getAutoDiffDerivativeFunctionLinearMapType(
           resolvedDiffParamIndices, kind.getLinearMapKind(),
-          LookUpConformanceInModule(derivative->getModuleContext()),
+          LookUpConformanceInModule(),
           /*makeSelfParamFirst*/ true);
 
   // Helper for diagnosing derivative function type errors.
@@ -6221,12 +6941,6 @@ static bool typeCheckDerivativeAttr(DerivativeAttr *attr) {
           .diagnose(attr->getLocation(),
                     diag::autodiff_attr_original_void_result,
                     originalAFD->getName())
-          .highlight(attr->getOriginalFunctionName().Loc.getSourceRange());
-      return;
-    case DerivativeFunctionTypeError::Kind::MultipleSemanticResults:
-      diags
-          .diagnose(attr->getLocation(),
-                    diag::autodiff_attr_original_multiple_semantic_results)
           .highlight(attr->getOriginalFunctionName().Loc.getSourceRange());
       return;
     case DerivativeFunctionTypeError::Kind::NoDifferentiabilityParameters:
@@ -6281,7 +6995,7 @@ static bool typeCheckDerivativeAttr(DerivativeAttr *attr) {
     // Emit differential/pullback type mismatch error on attribute.
     diags.diagnose(attr->getLocation(),
                    diag::derivative_attr_result_func_type_mismatch,
-                   funcResultElt.getName(), originalAFD->getName());
+                   funcResultElt.getName(), originalAFD);
     // Emit note with expected differential/pullback type on actual type
     // location.
     auto *tupleReturnTypeRepr =
@@ -6296,7 +7010,7 @@ static bool typeCheckDerivativeAttr(DerivativeAttr *attr) {
     if (originalAFD->getLoc().isValid())
       diags.diagnose(originalAFD->getLoc(),
                      diag::derivative_attr_result_func_original_note,
-                     originalAFD->getName());
+                     originalAFD);
     return true;
   }
 
@@ -6307,7 +7021,7 @@ static bool typeCheckDerivativeAttr(DerivativeAttr *attr) {
   if (derivativeAttrs.size() > 1) {
     diags.diagnose(attr->getLocation(),
                    diag::derivative_attr_original_already_has_derivative,
-                   originalAFD->getName());
+                   originalAFD);
     for (auto *duplicateAttr : derivativeAttrs) {
       if (duplicateAttr == attr)
         continue;
@@ -6318,7 +7032,9 @@ static bool typeCheckDerivativeAttr(DerivativeAttr *attr) {
   }
 
   // Register derivative function configuration.
-  auto *resultIndices = IndexSubset::get(Ctx, 1, {0});
+  auto *resultIndices =
+    autodiff::getFunctionSemanticResultIndices(originalAFD,
+                                               resolvedDiffParamIndices);
   originalAFD->addDerivativeFunctionConfiguration(
       {resolvedDiffParamIndices, resultIndices,
        derivative->getGenericSignature()});
@@ -6469,7 +7185,7 @@ static bool checkLinearityParameters(
         parsedLinearParams.empty() ? attrLoc : parsedLinearParams[i].getLoc();
     // Parameter must conform to `Differentiable` and satisfy
     // `Self == Self.TangentVector`.
-    if (!conformsToDifferentiable(linearParamType, module,
+    if (!conformsToDifferentiable(linearParamType,
                                   /*tangentVectorEqualsSelf*/ true)) {
       diags.diagnose(loc,
                      diag::transpose_attr_invalid_linearity_parameter_or_result,
@@ -6516,7 +7232,6 @@ doTransposeStaticAndInstanceSelfTypesMatch(AnyFunctionType *transposeType,
 
 void AttributeChecker::visitTransposeAttr(TransposeAttr *attr) {
   auto *transpose = cast<FuncDecl>(D);
-  auto *module = transpose->getParentModule();
   auto originalName = attr->getOriginalFunctionName();
   auto *transposeInterfaceType =
       transpose->getInterfaceType()->castTo<AnyFunctionType>();
@@ -6582,7 +7297,7 @@ void AttributeChecker::visitTransposeAttr(TransposeAttr *attr) {
   if (expectedOriginalResultType->hasTypeParameter())
     expectedOriginalResultType = transpose->mapTypeIntoContext(
         expectedOriginalResultType);
-  if (!conformsToDifferentiable(expectedOriginalResultType, module,
+  if (!conformsToDifferentiable(expectedOriginalResultType,
                                 /*tangentVectorEqualsSelf*/ true)) {
     diagnoseAndRemoveAttr(
         attr, diag::transpose_attr_invalid_linearity_parameter_or_result,
@@ -6591,19 +7306,19 @@ void AttributeChecker::visitTransposeAttr(TransposeAttr *attr) {
   }
 
   auto isValidOriginalCandidate = [&](AbstractFunctionDecl *originalCandidate)
-      -> Optional<AbstractFunctionDeclLookupErrorKind> {
+      -> std::optional<AbstractFunctionDeclLookupErrorKind> {
     // Error if the original candidate does not have the expected type.
     if (!checkFunctionSignature(
             cast<AnyFunctionType>(expectedOriginalFnType->getCanonicalType()),
             originalCandidate->getInterfaceType()->getCanonicalType()))
       return AbstractFunctionDeclLookupErrorKind::CandidateTypeMismatch;
-    return None;
+    return std::nullopt;
   };
 
   Type baseType;
   if (attr->getBaseTypeRepr()) {
     baseType = TypeResolution::resolveContextualType(
-        attr->getBaseTypeRepr(), transpose->getDeclContext(), None,
+        attr->getBaseTypeRepr(), transpose->getDeclContext(), std::nullopt,
         /*unboundTyOpener*/ nullptr,
         /*placeholderHandler*/ nullptr,
         /*packElementOpener*/ nullptr);
@@ -6630,7 +7345,7 @@ void AttributeChecker::visitTransposeAttr(TransposeAttr *attr) {
   attr->setOriginalFunction(originalAFD);
 
   // Diagnose if original function has opaque result types.
-  if (auto *opaqueResultTypeDecl = originalAFD->getOpaqueResultTypeDecl()) {
+  if (originalAFD->getOpaqueResultTypeDecl()) {
     diagnose(attr->getLocation(),
              diag::autodiff_attr_opaque_result_type_unsupported);
     attr->setInvalid();
@@ -6667,15 +7382,14 @@ void AttributeChecker::visitTransposeAttr(TransposeAttr *attr) {
     bool transposeMustBeStatic = !transpose->isStatic();
     diagnose(attr->getOriginalFunctionName().Loc.getBaseNameLoc(),
              diag::transpose_attr_static_method_mismatch_original,
-             originalAFD->getName(), transpose->getName(),
-             transposeMustBeStatic)
+             originalAFD, transpose, transposeMustBeStatic)
         .highlight(attr->getOriginalFunctionName().Loc.getSourceRange());
     diagnose(originalAFD->getNameLoc(),
              diag::transpose_attr_static_method_mismatch_original_note,
-             originalAFD->getName(), transposeMustBeStatic);
+             originalAFD, transposeMustBeStatic);
     auto fixItDiag = diagnose(transpose->getStartLoc(),
                               diag::transpose_attr_static_method_mismatch_fix,
-                              transpose->getName(), transposeMustBeStatic);
+                              transpose, transposeMustBeStatic);
     if (transposeMustBeStatic) {
       fixItDiag.fixItInsert(transpose->getStartLoc(), "static ");
     } else {
@@ -6758,13 +7472,19 @@ void AttributeChecker::visitDistributedActorAttr(DistributedActorAttr *attr) {
 }
 
 void AttributeChecker::visitKnownToBeLocalAttr(KnownToBeLocalAttr *attr) {
-  if (!D->isImplicit()) {
+  auto &ctx = D->getASTContext();
+  auto *module = D->getDeclContext()->getParentModule();
+  auto *distributed = ctx.getLoadedModule(ctx.Id_Distributed);
+
+  // FIXME: An explicit `_local` is used in the implementation of
+  // `DistributedActor.whenLocal`, which otherwise violates actor
+  // isolation checking.
+  if (!D->isImplicit() && (module != distributed)) {
     diagnoseAndRemoveAttr(attr, diag::distributed_local_cannot_be_used);
   }
 }
 
 void AttributeChecker::visitSendableAttr(SendableAttr *attr) {
-
   if ((isa<AbstractFunctionDecl>(D) || isa<AbstractStorageDecl>(D)) &&
       !isAsyncDecl(cast<ValueDecl>(D))) {
     auto value = cast<ValueDecl>(D);
@@ -6772,8 +7492,20 @@ void AttributeChecker::visitSendableAttr(SendableAttr *attr) {
     if (isolation.isActorIsolated()) {
       diagnoseAndRemoveAttr(
           attr, diag::sendable_isolated_sync_function,
-          isolation, value->getDescriptiveKind(), value->getName())
+          isolation, value)
         .warnUntilSwiftVersion(6);
+    }
+  }
+  // Prevent Sendable Attr from being added to methods of non-sendable types
+  if (auto *funcDecl = dyn_cast<AbstractFunctionDecl>(D)) {
+    if (auto selfDecl = funcDecl->getImplicitSelfDecl()) {
+      diagnoseIfAnyNonSendableTypes(
+          selfDecl->getTypeInContext(),
+          SendableCheckContext(funcDecl),
+          Type(),
+          SourceLoc(),
+          attr->getLocation(),
+          diag::nonsendable_instance_method);
     }
   }
 }
@@ -6785,12 +7517,43 @@ void AttributeChecker::visitNonisolatedAttr(NonisolatedAttr *attr) {
 
   if (auto var = dyn_cast<VarDecl>(D)) {
     // stored properties have limitations as to when they can be nonisolated.
+    auto type = var->getTypeInContext();
     if (var->hasStorage()) {
+      {
+        // A stored property can be 'nonisolated' if it is a 'Sendable' member
+        // of a 'Sendable' value type.
+        bool canBeNonisolated = false;
+        if (auto nominal = dc->getSelfStructDecl()) {
+          if (nominal->getDeclaredTypeInContext()->isSendableType() &&
+              !var->isStatic() && type->isSendableType()) {
+            canBeNonisolated = true;
+          }
+        }
 
-      // 'nonisolated' can not be applied to mutable stored properties.
-      if (var->supportsMutation()) {
-        diagnoseAndRemoveAttr(attr, diag::nonisolated_mutable_storage);
-        return;
+          // Additionally, a stored property of a non-'Sendable' type can be
+          // explicitly marked 'nonisolated'.
+          if (auto parentDecl = dc->getDeclaredTypeInContext())
+            if (!parentDecl->isSendableType()) {
+              canBeNonisolated = true;
+            }
+
+        // Otherwise, this stored property has to be qualified as 'unsafe'.
+        if (var->supportsMutation() && !attr->isUnsafe() && !canBeNonisolated) {
+          diagnoseAndRemoveAttr(attr, diag::nonisolated_mutable_storage)
+              .fixItInsertAfter(attr->getRange().End, "(unsafe)");
+          var->diagnose(diag::nonisolated_mutable_storage_note, var);
+          return;
+        }
+
+        // 'nonisolated' without '(unsafe)' is not allowed on non-Sendable
+        // variables, unless they are a member of a non-'Sendable' type.
+        if (!attr->isUnsafe() && !type->hasError() && !canBeNonisolated) {
+          bool diagnosed = diagnoseIfAnyNonSendableTypes(
+              type, SendableCheckContext(dc), Type(), SourceLoc(),
+              attr->getLocation(), diag::nonisolated_non_sendable);
+          if (diagnosed)
+            return;
+        }
       }
 
       if (auto nominal = dyn_cast<NominalTypeDecl>(dc)) {
@@ -6802,37 +7565,68 @@ void AttributeChecker::visitNonisolatedAttr(NonisolatedAttr *attr) {
         // The synthesized "id" and "actorSystem" are the only exceptions,
         // because the implementation mirrors them.
         if (nominal->isDistributedActor() &&
-            !(var->isImplicit() &&
-              (var->getName() == Ctx.Id_id ||
-               var->getName() == Ctx.Id_actorSystem))) {
+            !(var->getName() == Ctx.Id_id ||
+              var->getName() == Ctx.Id_actorSystem)) {
           diagnoseAndRemoveAttr(attr,
                                 diag::nonisolated_distributed_actor_storage);
           return;
         }
+      }
 
-        // 'nonisolated' is redundant for the stored properties of a struct.
-        if (isa<StructDecl>(nominal) &&
-            !var->isStatic() &&
-            var->isOrdinaryStoredProperty() &&
-            !isWrappedValueOfPropWrapper(var)) {
-          diagnoseAndRemoveAttr(attr, diag::nonisolated_storage_value_type,
-                                nominal->getDescriptiveKind())
-            .warnUntilSwiftVersion(6);
-          return;
+      // 'nonisolated(unsafe)' is redundant for 'Sendable' immutables.
+      if (attr->isUnsafe() &&
+          type->isSendableType() &&
+          var->isLet()) {
+
+        // '(unsafe)' is redundant for a public actor-isolated 'Sendable'
+        // immutable.
+        auto nominal = dyn_cast<NominalTypeDecl>(dc);
+        if (nominal && nominal->isActor()) {
+          auto access = nominal->getFormalAccessScope(
+              /*useDC=*/nullptr,
+              /*treatUsableFromInlineAsPublic=*/true);
+          if (access.isPublic()) {
+            // Get the location where '(unsafe)' starts.
+            SourceLoc unsafeStart = Lexer::getLocForEndOfToken(
+                Ctx.SourceMgr, attr->getRange().Start);
+            diagnose(unsafeStart, diag::unsafe_sendable_actor_constant, type)
+                .fixItRemoveChars(unsafeStart,
+                                  attr->getRange().End.getAdvancedLoc(1));
+          } else {
+            // This actor is not public, so suggest to remove
+            // 'nonisolated(unsafe)'.
+            diagnose(attr->getLocation(),
+                     diag::nonisolated_unsafe_sendable_actor_constant, type)
+                .fixItRemove(attr->getRange());
+          }
+
+        } else {
+          diagnose(attr->getLocation(),
+                   diag::nonisolated_unsafe_sendable_constant, type)
+              .fixItRemove(attr->getRange());
         }
       }
     }
 
-    // Using 'nonisolated' with wrapped properties is unsupported, because
-    // backing storage is a stored 'var' that is part of the internal state
-    // of the actor which could only be accessed in actor's isolation context.
+    // Using 'nonisolated' with lazy properties and wrapped properties is
+    // unsupported, because backing storage is a stored 'var' that is part
+    // of the internal state of the actor which could only be accessed in
+    // actor's isolation context.
     if (var->hasAttachedPropertyWrapper()) {
-      diagnoseAndRemoveAttr(attr, diag::nonisolated_wrapped_property);
+      diagnoseAndRemoveAttr(attr, diag::nonisolated_wrapped_property)
+        .warnUntilSwiftVersionIf(attr->isImplicit(), 6);
       return;
     }
 
-    // nonisolated can not be applied to local properties.
-    if (dc->isLocalContext()) {
+    if (var->getAttrs().hasAttribute<LazyAttr>()) {
+      diagnose(attr->getLocation(), diag::nonisolated_lazy)
+        .warnUntilSwiftVersion(6);
+      return;
+    }
+
+    // nonisolated can not be applied to local properties unless qualified as
+    // 'unsafe'.
+    if (dc->isLocalContext() && !attr->isUnsafe()) {
       diagnoseAndRemoveAttr(attr, diag::nonisolated_local_var);
       return;
     }
@@ -6843,8 +7637,8 @@ void AttributeChecker::visitNonisolatedAttr(NonisolatedAttr *attr) {
       return;
     }
   }
-  
-  // `nonisolated` on non-async actor initializers is invalid
+
+  // `nonisolated` on non-async actor initializers is invalid.
   // the reasoning is that there is a "little bit" of isolation,
   // as afforded by flow-isolation.
   if (auto ctor = dyn_cast<ConstructorDecl>(D)) {
@@ -6860,9 +7654,26 @@ void AttributeChecker::visitNonisolatedAttr(NonisolatedAttr *attr) {
     }
   }
 
+  diagnoseIsolatedDeinitInValueTypes(attr);
+
   if (auto VD = dyn_cast<ValueDecl>(D)) {
+    //'nonisolated(unsafe)' is meaningless for computed properties, functions etc.
+    auto var = dyn_cast<VarDecl>(VD);
+    if (attr->isUnsafe() &&
+        (!var || !var->hasStorage())) {
+      auto &ctx = VD->getASTContext();
+      ctx.Diags.diagnose(attr->getStartLoc(),
+                         diag::nonisolated_unsafe_uneffective_on_funcs,
+                         VD->getDescriptiveKind(), VD)
+          .fixItReplace(attr->getStartLoc(), "nonisolated");
+    }
+
     (void)getActorIsolation(VD);
   }
+}
+
+void AttributeChecker::visitIsolatedAttr(IsolatedAttr *attr) {
+  diagnoseIsolatedDeinitInValueTypes(attr);
 }
 
 void AttributeChecker::visitGlobalActorAttr(GlobalActorAttr *attr) {
@@ -6872,12 +7683,14 @@ void AttributeChecker::visitGlobalActorAttr(GlobalActorAttr *attr) {
 
   auto &context = nominal->getASTContext();
   if (context.LangOpts.isConcurrencyModelTaskToThread() &&
-      !AvailableAttr::isUnavailable(nominal)) {
+      !nominal->isUnavailable()) {
     context.Diags.diagnose(attr->getLocation(),
                            diag::concurrency_task_to_thread_model_global_actor,
                            "task-to-thread concurrency model");
     return;
   }
+
+  diagnoseIsolatedDeinitInValueTypes(attr);
 
   (void)nominal->isGlobalActor();
 }
@@ -6940,21 +7753,25 @@ void AttributeChecker::visitMarkerAttr(MarkerAttr *attr) {
   if (!proto)
     return;
 
-  // A marker protocol cannot inherit a non-marker protocol.
-  for (auto inheritedProto : proto->getInheritedProtocols()) {
-    if (!inheritedProto->isMarkerProtocol()) {
-      proto->diagnose(
-          diag::marker_protocol_inherit_nonmarker,
-          proto->getName(), inheritedProto->getName());
-      inheritedProto->diagnose(
-          diag::decl_declared_here, inheritedProto->getName());
-    }
-  }
+  for (auto req : proto->getRequirementSignature().getRequirements()) {
+    if (!req.getFirstType()->isEqual(proto->getSelfInterfaceType()))
+      continue;
 
-  if (Type superclass = proto->getSuperclass()) {
-    proto->diagnose(
+    if (req.getKind() == RequirementKind::Superclass) {
+      // A marker protocol cannot have a superclass requirement.
+      proto->diagnose(
         diag::marker_protocol_inherit_class,
-        proto->getName(), superclass);
+        proto->getName(), req.getSecondType());
+    } else if (req.getKind() == RequirementKind::Conformance) {
+      // A marker protocol cannot inherit a non-marker protocol.
+      auto inheritedProto = req.getProtocolDecl();
+      if (!inheritedProto->isMarkerProtocol()) {
+        proto->diagnose(
+            diag::marker_protocol_inherit_nonmarker,
+            proto->getName(), inheritedProto->getName());
+        inheritedProto->diagnose( diag::decl_declared_here, inheritedProto);
+      }
+    }
   }
 
   // A marker protocol cannot have any requirements.
@@ -6990,7 +7807,7 @@ void AttributeChecker::visitUnavailableFromAsyncAttr(
       if (ValueDecl *vd = dyn_cast<ValueDecl>(D)) {
         D->getASTContext().Diags.diagnose(
             D->getLoc(), diag::async_named_decl_must_be_available_from_async,
-            D->getDescriptiveKind(), vd->getName());
+            vd);
       } else {
         D->getASTContext().Diags.diagnose(
             D->getLoc(), diag::async_decl_must_be_available_from_async,
@@ -7005,10 +7822,20 @@ void AttributeChecker::visitUnsafeInheritExecutorAttr(
   auto fn = cast<FuncDecl>(D);
   if (!fn->isAsyncContext()) {
     diagnose(attr->getLocation(), diag::inherits_executor_without_async);
+  } else if (fn->getBaseName().isSpecial() ||
+             fn->getParentModule()->getName().str() != "_Concurrency" ||
+             !fn->getBaseIdentifier().str()
+                .starts_with("_unsafeInheritExecutor_")) {
+    bool inConcurrencyModule = D->getDeclContext()->getParentModule()->getName()
+        .str() == "_Concurrency";
+    auto diag = fn->diagnose(diag::unsafe_inherits_executor_deprecated);
+    diag.warnUntilSwiftVersion(6);
+    diag.limitBehaviorIf(inConcurrencyModule, DiagnosticBehavior::Warning);
+    replaceUnsafeInheritExecutorWithDefaultedIsolationParam(fn, diag);
   }
 }
 
-bool AttributeChecker::visitLifetimeAttr(DeclAttribute *attr) {
+bool AttributeChecker::visitOwnershipAttr(DeclAttribute *attr) {
   if (auto *funcDecl = dyn_cast<FuncDecl>(D)) {
     auto declContext = funcDecl->getDeclContext();
     // eagerMove attribute may only appear in type context
@@ -7021,12 +7848,31 @@ bool AttributeChecker::visitLifetimeAttr(DeclAttribute *attr) {
 }
 
 void AttributeChecker::visitEagerMoveAttr(EagerMoveAttr *attr) {
-  if (visitLifetimeAttr(attr))
+  if (visitOwnershipAttr(attr))
     return;
+  if (auto *nominal = dyn_cast<NominalTypeDecl>(D)) {
+    if (nominal->getSelfTypeInContext()->isNoncopyable()) {
+      diagnoseAndRemoveAttr(attr, diag::eagermove_and_noncopyable_combined);
+      return;
+    }
+  }
+  if (auto *func = dyn_cast<FuncDecl>(D)) {
+    auto *self = func->getImplicitSelfDecl();
+    if (self && self->getTypeInContext()->isNoncopyable()) {
+      diagnoseAndRemoveAttr(attr, diag::eagermove_and_noncopyable_combined);
+      return;
+    }
+  }
+  if (auto *pd = dyn_cast<ParamDecl>(D)) {
+    if (pd->getTypeInContext()->isNoncopyable()) {
+      diagnoseAndRemoveAttr(attr, diag::eagermove_and_noncopyable_combined);
+      return;
+    }
+  }
 }
 
 void AttributeChecker::visitNoEagerMoveAttr(NoEagerMoveAttr *attr) {
-  if (visitLifetimeAttr(attr))
+  if (visitOwnershipAttr(attr))
     return;
   // @_noEagerMove and @_eagerMove are opposites and can't be combined.
   if (D->getAttrs().hasAttribute<EagerMoveAttr>()) {
@@ -7063,7 +7909,7 @@ void AttributeChecker::visitCompilerInitializedAttr(
 
   // Because optionals are implicitly initialized to nil according to the
   // language, this attribute doesn't make sense on optionals.
-  if (var->getType()->isOptional()) {
+  if (var->getTypeInContext()->isOptional()) {
     diagnose(attr->getLocation(), diag::optional_compilerinitialized);
     return;
   }
@@ -7077,80 +7923,193 @@ void AttributeChecker::visitCompilerInitializedAttr(
   }
 }
 
-void AttributeChecker::visitRuntimeMetadataAttr(RuntimeMetadataAttr *attr) {
-  if (!Ctx.LangOpts.hasFeature(Feature::RuntimeDiscoverableAttrs)) {
-    diagnose(attr->getLocation(),
-             diag::runtime_discoverable_attrs_are_experimental);
-    attr->setInvalid();
-    return;
-  }
-
-  auto nominal = dyn_cast<NominalTypeDecl>(D);
-  if (!nominal)
-    return;
-
-  enum class UnviabilityReason { Failable, Inaccessible };
-
-  llvm::SmallVector<ConstructorDecl *, 2> matchingInits;
-  llvm::SmallDenseMap<ConstructorDecl *, SmallVector<UnviabilityReason, 2>, 2>
-      nonViableInits;
-
-  // Check whether type marked as runtime attribute capable has an initializer
-  // with first parameter labeled as `attachedTo:`.
-  for (auto *member :
-       nominal->lookupDirect(DeclBaseName::createConstructor())) {
-    auto *init = dyn_cast<ConstructorDecl>(member);
-    if (!init)
-      continue;
-
-    auto *params = init->getParameters();
-    if (!params || params->size() == 0)
-      continue;
-
-    if (params->get(0)->getArgumentName() != Ctx.Id_attachedTo)
-      continue;
-
-    matchingInits.push_back(init);
-
-    if (init->isFailable())
-      nonViableInits[init].push_back(UnviabilityReason::Failable);
-
-    if (isMemberLessAccessibleThanType(nominal, init))
-      nonViableInits[init].push_back(UnviabilityReason::Inaccessible);
-  }
-
-  // If there are no matching initializers, let's complain.
-  if (matchingInits.empty()) {
-    diagnose(nominal->getLoc(), diag::runtime_attribute_requires_init,
-             nominal->getName());
-    attr->setInvalid();
-    return;
-  }
-
-  // If there are matching initializers but none of them are viable.
-  if (matchingInits.size() - nonViableInits.size() == 0) {
-    for (const auto &entry : nonViableInits) {
-      auto *init = entry.first;
-
-      for (auto reason : entry.second) {
-        switch (reason) {
-        case UnviabilityReason::Failable:
-          diagnose(init, diag::runtime_attribute_type_failable_init,
-                   init->getName());
-          break;
-
-        case UnviabilityReason::Inaccessible:
-          diagnose(init,
-                   diag::runtime_attribute_type_requirement_not_accessible,
-                   init->getFormalAccess(), init->getDescriptiveKind(),
-                   init->getName(), nominal->getDeclaredType(),
-                   nominal->getFormalAccess());
-          break;
-        }
-      }
+void AttributeChecker::visitMacroRoleAttr(MacroRoleAttr *attr) {
+  switch (attr->getMacroSyntax()) {
+  case MacroSyntax::Freestanding: {
+    switch (attr->getMacroRole()) {
+    case MacroRole::Expression:
+      if (!attr->getNames().empty())
+        diagnoseAndRemoveAttr(attr, diag::macro_cannot_introduce_names,
+                              getMacroRoleString(attr->getMacroRole()));
+      break;
+    case MacroRole::Declaration:
+      // TODO: Check names
+      break;
+    case MacroRole::CodeItem:
+      if (!attr->getNames().empty())
+        diagnoseAndRemoveAttr(attr, diag::macro_cannot_introduce_names,
+                              getMacroRoleString(attr->getMacroRole()));
+      break;
+    default:
+      diagnoseAndRemoveAttr(attr, diag::invalid_macro_role_for_macro_syntax,
+                            /*freestanding*/0);
+      break;
     }
+    break;
+  }
+  case MacroSyntax::Attached: {
+    switch (attr->getMacroRole()) {
+    case MacroRole::Accessor:
+      // TODO: Check property observer names?
+      break;
+    case MacroRole::MemberAttribute:
+    case MacroRole::Body:
+      if (!attr->getNames().empty())
+        diagnoseAndRemoveAttr(attr, diag::macro_cannot_introduce_names,
+                              getMacroRoleString(attr->getMacroRole()));
+      break;
+    case MacroRole::Member:
+      break;
+    case MacroRole::Peer:
+      break;
+    case MacroRole::Conformance: {
+      // Suppress the conformance macro error in swiftinterfaces.
+      if (D->getDeclContext()->isInSwiftinterface())
+        break;
 
-    attr->setInvalid();
+      diagnoseAndRemoveAttr(attr, diag::conformance_macro)
+          .fixItReplace(attr->getRange(),
+                        "@attached(extension, conformances: <#Protocol#>)");
+      break;
+    }
+    case MacroRole::Extension:
+    case MacroRole::Preamble:
+      break;
+    default:
+      diagnoseAndRemoveAttr(attr, diag::invalid_macro_role_for_macro_syntax,
+                            /*attached*/1);
+      break;
+    }
+    break;
+  }
+  }
+
+  (void)evaluateOrDefault(
+      Ctx.evaluator,
+      ResolveMacroConformances{attr, D},
+      {});
+}
+
+void AttributeChecker::visitRawLayoutAttr(RawLayoutAttr *attr) {
+  if (!Ctx.LangOpts.hasFeature(Feature::RawLayout)) {
+    diagnoseAndRemoveAttr(attr, diag::attr_rawlayout_experimental);
+    return;
+  }
+
+  // Can only apply to structs.
+  auto sd = dyn_cast<StructDecl>(D);
+  if (!sd) {
+    diagnoseAndRemoveAttr(attr, diag::attr_only_one_decl_kind,
+                          attr, "struct");
+    return;
+  }
+  
+  if (sd->canBeCopyable()) {
+    diagnoseAndRemoveAttr(attr, diag::attr_rawlayout_cannot_be_copyable);
+  }
+  
+  if (!sd->getStoredProperties().empty()) {
+    diagnoseAndRemoveAttr(attr, diag::attr_rawlayout_cannot_have_stored_properties);
+  }
+
+  if (auto sizeAndAlign = attr->getSizeAndAlignment()) {
+    // Alignment must be a power of two.
+    auto align = sizeAndAlign->second;
+    if (align == 0 || (align & (align - 1)) != 0) {
+      diagnoseAndRemoveAttr(attr, diag::alignment_not_power_of_two);
+      return;
+    }
+  } else if (attr->getScalarLikeType()) {
+    (void)attr->getResolvedLikeType(sd);
+  } else if (attr->getArrayLikeTypeAndCount()) {
+    (void)attr->getResolvedLikeType(sd);
+    auto countType = attr->getResolvedCountType(sd);
+
+    // Raw layout's count type can only either be an archetype or an integer
+    // type.
+    if (!countType->is<IntegerType>() && !countType->is<ArchetypeType>()) {
+      diagnoseAndRemoveAttr(attr, diag::attr_rawlayout_invalid_count_type);
+      return;
+    }
+  } else {
+    llvm_unreachable("new unhandled rawLayout attribute form?");
+  }
+  
+  // If the type also specifies an `@_alignment`, that's an error.
+  // Maybe this is interesting to support to have a layout like another
+  // type but with different alignment in the future.
+  if (D->getAttrs().hasAttribute<AlignmentAttr>()) {
+    diagnoseAndRemoveAttr(attr, diag::attr_rawlayout_cannot_have_alignment_attr);
+    return;
+  }
+  
+  // The storage is not directly referenceable by stored properties.
+  sd->setHasUnreferenceableStorage(true);
+}
+
+void AttributeChecker::visitNonEscapableAttr(NonEscapableAttr *attr) {}
+
+void AttributeChecker::visitUnsafeNonEscapableResultAttr(
+    UnsafeNonEscapableResultAttr *attr) {}
+
+void AttributeChecker::visitStaticExclusiveOnlyAttr(
+    StaticExclusiveOnlyAttr *attr) {
+  if (!Ctx.LangOpts.hasFeature(Feature::StaticExclusiveOnly)) {
+    diagnoseAndRemoveAttr(attr, diag::attr_static_exclusive_only_disabled);
+    return;
+  }
+
+  // Can only be applied to structs.
+  auto structDecl = cast<StructDecl>(D);
+
+  if (structDecl->canBeCopyable() != TypeDecl::CanBeInvertible::Never) {
+    diagnoseAndRemoveAttr(attr, diag::attr_static_exclusive_only_noncopyable);
+  }
+}
+
+void AttributeChecker::visitWeakLinkedAttr(WeakLinkedAttr *attr) {
+  if (!Ctx.LangOpts.Target.isOSBinFormatCOFF())
+    return;
+
+  diagnoseAndRemoveAttr(attr, diag::attr_unsupported_on_target,
+                        attr->getAttrName(), Ctx.LangOpts.Target.str());
+}
+
+void AttributeChecker::visitUnsafeAttr(UnsafeAttr *attr) {
+  if (Ctx.LangOpts.hasFeature(Feature::AllowUnsafeAttribute))
+    return;
+
+  diagnoseAndRemoveAttr(attr, diag::unsafe_attr_disabled);
+}
+
+void AttributeChecker::visitSafeAttr(SafeAttr *attr) {
+  if (Ctx.LangOpts.hasFeature(Feature::AllowUnsafeAttribute))
+    return;
+
+  diagnoseAndRemoveAttr(attr, diag::unsafe_attr_disabled);
+}
+
+void AttributeChecker::visitLifetimeAttr(LifetimeAttr *attr) {}
+
+void AttributeChecker::visitAddressableSelfAttr(AddressableSelfAttr *attr) {
+  if (!Ctx.LangOpts.hasFeature(Feature::AddressableParameters)) {
+    Ctx.Diags.diagnose(attr->getLocation(), diag::addressable_not_enabled);
+  }
+  
+  if (!D->getDeclContext()->isTypeContext()) {
+    Ctx.Diags.diagnose(attr->getLocation(), diag::addressableSelf_not_on_method);
+  }
+}
+
+void
+AttributeChecker::visitAddressableForDependenciesAttr(
+                                         AddressableForDependenciesAttr *attr) {
+  if (!Ctx.LangOpts.hasFeature(Feature::AddressableTypes)) {
+    Ctx.Diags.diagnose(attr->getLocation(), diag::addressable_types_not_enabled);
+  }
+  
+  if (isa<ClassDecl>(D)) {
+    Ctx.Diags.diagnose(attr->getLocation(), diag::class_cannot_be_addressable_for_dependencies);
   }
 }
 
@@ -7176,13 +8135,20 @@ public:
     // Nothing else to check.
   }
 
+  void visitNonisolatedAttr(NonisolatedAttr *attr) {
+    if (attr->isUnsafe() ||
+        !ctx.LangOpts.hasFeature(Feature::ClosureIsolation)) {
+      visitDeclAttribute(attr);
+    }
+  }
+
   void visitCustomAttr(CustomAttr *attr) {
     // Check whether this custom attribute is the global actor attribute.
     auto globalActorAttr = evaluateOrDefault(
-        ctx.evaluator, GlobalActorAttributeRequest{closure}, None);
+        ctx.evaluator, GlobalActorAttributeRequest{closure}, std::nullopt);
 
     if (globalActorAttr && globalActorAttr->first == attr) {
-      // if there is an `isolated` parameter, then this global-actor attribute
+      // If there is an `isolated` parameter, then this global-actor attribute
       // is invalid.
       for (auto param : *closure->getParameters()) {
         if (param->isIsolated()) {
@@ -7265,8 +8231,8 @@ static bool parametersMatch(const AbstractFunctionDecl *a,
     return false;
 
   for (auto index : indices(*aParams)) {
-    auto aParamType = aParams->get(index)->getType();
-    auto bParamType = bParams->get(index)->getType();
+    auto aParamType = aParams->get(index)->getTypeInContext();
+    auto bParamType = bParams->get(index)->getTypeInContext();
     if (!aParamType->matchesParameter(bParamType, TypeMatchOptions()))
       return false;
   }
@@ -7278,9 +8244,6 @@ ValueDecl *RenamedDeclRequest::evaluate(Evaluator &evaluator,
                                         const AvailableAttr *attr) const {
   if (!attached || !attr)
     return nullptr;
-
-  if (attr->RenameDecl)
-    return attr->RenameDecl;
 
   if (attr->Rename.empty())
     return nullptr;
@@ -7297,7 +8260,8 @@ ValueDecl *RenamedDeclRequest::evaluate(Evaluator &evaluator,
     SmallVector<ValueDecl *, 1> lookupResults;
     attachedContext->lookupQualified(attachedContext->getParentModule(),
                                      nameRef.withoutArgumentLabels(),
-                                     NL_OnlyTypes, lookupResults);
+                                     attr->getLocation(), NL_OnlyTypes,
+                                     lookupResults);
     if (lookupResults.size() == 1)
       return lookupResults[0];
     return nullptr;
@@ -7360,7 +8324,7 @@ ValueDecl *RenamedDeclRequest::evaluate(Evaluator &evaluator,
   // completion handler has been removed).
   if (!renamedDecl && !asyncResults.empty()) {
     for (AbstractFunctionDecl *candidate : asyncResults) {
-      Optional<unsigned> completionHandler =
+      std::optional<unsigned> completionHandler =
           attachedFunc->findPotentialCompletionHandlerParam(candidate);
       if (!completionHandler)
         continue;
@@ -7380,96 +8344,221 @@ ValueDecl *RenamedDeclRequest::evaluate(Evaluator &evaluator,
   return renamedDecl;
 }
 
+static std::optional<AvailabilityDomain>
+getAvailabilityDomainForName(Identifier identifier,
+                             const DeclContext *declContext) {
+  if (auto builtinDomain = AvailabilityDomain::builtinDomainForString(
+          identifier.str(), declContext))
+    return builtinDomain;
+
+  auto &ctx = declContext->getASTContext();
+  if (auto customDomain =
+          ctx.MainModule->getAvailabilityDomainForIdentifier(identifier))
+    return customDomain;
+
+  return std::nullopt;
+}
+
+std::optional<SemanticAvailableAttr>
+SemanticAvailableAttrRequest::evaluate(swift::Evaluator &evaluator,
+                                       const AvailableAttr *attr,
+                                       const Decl *decl) const {
+  if (attr->hasCachedDomain())
+    return SemanticAvailableAttr(attr);
+
+  auto &ctx = decl->getASTContext();
+  auto &diags = ctx.Diags;
+  auto attrLoc = attr->getLocation();
+  auto attrName = attr->getAttrName();
+  auto domainLoc = attr->getDomainLoc();
+  auto introducedVersion = attr->getRawIntroduced();
+  auto deprecatedVersion = attr->getRawDeprecated();
+  auto obsoletedVersion = attr->getRawObsoleted();
+  auto mutableAttr = const_cast<AvailableAttr *>(attr);
+  auto domain = attr->getCachedDomain();
+
+  if (!domain) {
+    auto domainIdentifier = attr->getDomainIdentifier();
+    ASSERT(domainIdentifier);
+
+    // Attempt to resolve the domain specified for the attribute and diagnose
+    // if no domain is found.
+    auto declContext = decl->getInnermostDeclContext();
+    domain = getAvailabilityDomainForName(*domainIdentifier, declContext);
+    if (!domain) {
+      auto domainString = domainIdentifier->str();
+      if (auto suggestion = closestCorrectedPlatformString(domainString)) {
+        diags
+            .diagnose(domainLoc, diag::attr_availability_suggest_platform,
+                      domainString, attrName, *suggestion)
+            .fixItReplace(SourceRange(domainLoc), *suggestion);
+      } else {
+        diags.diagnose(attrLoc, diag::attr_availability_unknown_platform,
+                       domainString, attrName);
+      }
+      return std::nullopt;
+    }
+
+    if (domain->isCustom() &&
+        !ctx.LangOpts.hasFeature(Feature::CustomAvailability) &&
+        !declContext->isInSwiftinterface()) {
+      diags.diagnose(domainLoc,
+                     diag::attr_availability_requires_custom_availability,
+                     domain->getNameForAttributePrinting(), attr);
+      return std::nullopt;
+    }
+
+    mutableAttr->setCachedDomain(*domain);
+  }
+
+  auto domainName = domain->getNameForAttributePrinting();
+  auto semanticAttr = SemanticAvailableAttr(attr);
+
+  bool hasVersionSpec =
+      (introducedVersion || deprecatedVersion || obsoletedVersion);
+
+  if (!domain->isVersioned() && hasVersionSpec) {
+    SourceRange versionSourceRange;
+    if (introducedVersion)
+      versionSourceRange = semanticAttr.getIntroducedSourceRange();
+    else if (deprecatedVersion)
+      versionSourceRange = semanticAttr.getDeprecatedSourceRange();
+    else if (obsoletedVersion)
+      versionSourceRange = semanticAttr.getObsoletedSourceRange();
+
+    diags
+        .diagnose(attrLoc, diag::attr_availability_unexpected_version, attr,
+                  domainName)
+        .highlight(versionSourceRange);
+    return std::nullopt;
+  }
+
+  if (domain->isSwiftLanguage() || domain->isPackageDescription()) {
+    switch (attr->getKind()) {
+    case AvailableAttr::Kind::Deprecated:
+      diags.diagnose(attrLoc,
+                     diag::attr_availability_expected_deprecated_version,
+                     attrName, domainName);
+      return std::nullopt;
+
+    case AvailableAttr::Kind::Unavailable:
+      diags.diagnose(attrLoc, diag::attr_availability_cannot_be_used_for_domain,
+                     "unavailable", attrName, domainName);
+      return std::nullopt;
+
+    case AvailableAttr::Kind::NoAsync:
+      diags.diagnose(attrLoc, diag::attr_availability_cannot_be_used_for_domain,
+                     "noasync", attrName, domainName);
+      return std::nullopt;
+
+    case AvailableAttr::Kind::Default:
+      break;
+    }
+
+    if (!hasVersionSpec) {
+      diags.diagnose(attrLoc, diag::attr_availability_expected_version_spec,
+                     attrName, domainName);
+      return std::nullopt;
+    }
+  }
+
+  // Canonicalize platform versions.
+  // FIXME: [availability] This should be done when remapping versions instead.
+  if (domain->isPlatform()) {
+    auto canonicalizeVersion = [&](llvm::VersionTuple version) {
+      return canonicalizePlatformVersion(domain->getPlatformKind(), version);
+    };
+    if (introducedVersion)
+      mutableAttr->setRawIntroduced(canonicalizeVersion(*introducedVersion));
+
+    if (deprecatedVersion)
+      mutableAttr->setRawDeprecated(canonicalizeVersion(*deprecatedVersion));
+
+    if (obsoletedVersion)
+      mutableAttr->setRawObsoleted(canonicalizeVersion(*obsoletedVersion));
+  }
+
+  return semanticAttr;
+}
+
 template <typename ATTR>
 static void forEachCustomAttribute(
-    ValueDecl *decl,
+    Decl *decl,
     llvm::function_ref<void(CustomAttr *attr, NominalTypeDecl *)> fn) {
   auto &ctx = decl->getASTContext();
 
   for (auto *attr : decl->getAttrs().getAttributes<CustomAttr>()) {
     auto *mutableAttr = const_cast<CustomAttr *>(attr);
 
-    auto found = evaluateOrDefault(
+    auto *nominal = evaluateOrDefault(
         ctx.evaluator,
-        CustomAttrDeclRequest{mutableAttr, decl->getDeclContext()}, nullptr);
-    if (!found)
-      continue;
-
-    auto nominal = found.dyn_cast<NominalTypeDecl *>();
+        CustomAttrNominalRequest{mutableAttr, decl->getDeclContext()}, nullptr);
     if (!nominal)
-      continue; // FIXME: add another entry point for macros we've found
+      continue;
 
     if (nominal->getAttrs().hasAttribute<ATTR>())
       fn(mutableAttr, nominal);
   }
 }
 
-ArrayRef<CustomAttr *>
-GetRuntimeDiscoverableAttributes::evaluate(Evaluator &evaluator,
-                                           ValueDecl *decl) const {
-  auto &ctx = decl->getASTContext();
+ArrayRef<VarDecl *> InitAccessorReferencedVariablesRequest::evaluate(
+    Evaluator &evaluator, DeclAttribute *attr, AccessorDecl *attachedTo,
+    ArrayRef<Identifier> referencedVars) const {
+  auto &ctx = attachedTo->getASTContext();
 
-  llvm::SmallMapVector<NominalTypeDecl *, CustomAttr *, 4> attrs;
+  auto *storage = attachedTo->getStorage();
 
-  enum class GatheringMode { Direct, Inference };
+  auto typeDC = storage->getDeclContext()->getSelfNominalTypeDecl();
+  if (!typeDC)
+    return ctx.AllocateCopy(ArrayRef<VarDecl *>());
 
-  auto gatherRuntimeAttrsOnDecl =
-      [&](ValueDecl *decl,
-          llvm::SmallMapVector<NominalTypeDecl *, CustomAttr *, 4> &attrs,
-          GatheringMode mode) {
-        forEachCustomAttribute<RuntimeMetadataAttr>(
-            decl, [&](CustomAttr *attr, NominalTypeDecl *attrType) {
-              // Ignore duplicate attrs if they are inferred from
-              // protocols.
-              if (attrs.count(attrType) && mode == GatheringMode::Direct) {
-                ctx.Diags
-                    .diagnose(attr->getLocation(),
-                              diag::duplicate_runtime_discoverable_attr)
-                    .highlight(attr->getRange());
-                attr->setInvalid();
-                return;
-              }
+  SmallVector<VarDecl *> results;
 
-              (void)attrs.insert({attrType, attr});
-            });
-      };
-
-  auto copyAttrs =
-      [&](llvm::SmallMapVector<NominalTypeDecl *, CustomAttr *, 4> &attrs)
-      -> ArrayRef<CustomAttr *> {
-    auto copy = ctx.AllocateUninitialized<CustomAttr *>(attrs.size());
-    {
-      unsigned index = 0;
-      for (const auto &entry : attrs)
-        copy[index++] = entry.second;
+  bool failed = false;
+  for (auto name : referencedVars) {
+    auto propertyResults = typeDC->lookupDirect(DeclName(name));
+    switch (propertyResults.size()) {
+    case 0: {
+      ctx.Diags.diagnose(attr->getLocation(), diag::cannot_find_type_in_scope,
+                         DeclNameRef(name));
+      failed = true;
+      break;
     }
-    return copy;
-  };
 
-  // First, gather all of the runtime attributes directly on the decl.
-  gatherRuntimeAttrsOnDecl(decl, attrs, GatheringMode::Direct);
+    case 1: {
+      auto *member = propertyResults.front();
 
-  auto *NTD = dyn_cast<NominalTypeDecl>(decl);
-  // Attribute inference is only possible from protocol conformances.
-  if (!NTD || isa<ProtocolDecl>(NTD) || NTD->getDeclContext()->isLocalContext())
-    return copyAttrs(attrs);
+      // Only stored properties are supported.
+      if (auto *var = dyn_cast<VarDecl>(member)) {
+        if (var->getImplInfo().hasStorage()) {
+          results.push_back(var);
+          break;
+        }
+      }
 
-  // Gather any attributes inferred from (explicit) protocol conformances
-  // associated with the declaration of the type.
-  for (unsigned i : indices(NTD->getInherited())) {
-    auto inheritedType = evaluateOrDefault(
-        ctx.evaluator,
-        InheritedTypeRequest{NTD, i, TypeResolutionStage::Interface}, Type());
+      ctx.Diags.diagnose(attr->getLocation(),
+                         diag::init_accessor_can_refer_only_to_properties,
+                         member->getDescriptiveKind(), member->createNameRef());
+      failed = true;
+      break;
+    }
 
-    if (!(inheritedType && inheritedType->isConstraintType()))
-      continue;
+    default:
+      ctx.Diags.diagnose(attr->getLocation(),
+                         diag::ambiguous_member_overload_set,
+                         DeclNameRef(name));
 
-    auto *protocol = inheritedType->getAnyNominal();
-    if (!protocol)
-      continue;
+      for (auto *choice : propertyResults) {
+        ctx.Diags.diagnose(choice, diag::decl_declared_here, choice);
+      }
 
-    gatherRuntimeAttrsOnDecl(protocol, attrs, GatheringMode::Inference);
+      failed = true;
+      break;
+    }
   }
 
-  return copyAttrs(attrs);
+  if (failed)
+    return ctx.AllocateCopy(ArrayRef<VarDecl *>());
+
+  return ctx.AllocateCopy(results);
 }

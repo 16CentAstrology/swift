@@ -1,5 +1,5 @@
-// RUN: %target-swift-emit-sil %s -target %target-cpu-apple-macosx10.50 -verify
-// RUN: %target-swift-emit-silgen %s -target %target-cpu-apple-macosx10.50 | %FileCheck %s
+// RUN: %target-swift-emit-sil -Xllvm -sil-print-types %s -target %target-cpu-apple-macosx10.50 -verify
+// RUN: %target-swift-emit-silgen -Xllvm -sil-print-types %s -target %target-cpu-apple-macosx10.50 | %FileCheck %s
 
 // REQUIRES: OS=macosx
 
@@ -121,7 +121,7 @@ func testUnreachableVersionAvailable(condition: Bool) {
   if true {
     doThing() // no-warning
   }
-  if false { // expected-note {{condition always evaluates to false}}
+  if 1 == 0 { // expected-note {{condition always evaluates to false}}
     doThing() // expected-warning {{will never be executed}}
   }
 }
@@ -144,8 +144,8 @@ func testUnreachablePlatformAvailable(condition: Bool) {
   if true {
     doThing() // no-warning
   }
-  if false { // expected-note {{condition always evaluates to false}}
-    doThing() // expected-warning {{will never be executed}}
+  if false {
+    doThing()
   }
 }
 

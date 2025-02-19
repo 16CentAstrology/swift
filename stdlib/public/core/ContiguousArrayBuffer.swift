@@ -57,8 +57,63 @@ internal final class __EmptyArrayStorage
 
   /// A type that every element in the array is.
   @inlinable
+  @_unavailableInEmbedded
   override internal var staticElementType: Any.Type {
     return Void.self
+  }
+}
+
+#if $Embedded
+// In embedded Swift, the stdlib is a .swiftmodule only without any .o/.a files,
+// to allow consuming it by clients with different LLVM codegen setting (-mcpu
+// flags, etc.), which means we cannot declare the singleton in a C/C++ file.
+//
+// TODO: We should figure out how to make this a constant so that it's placed in
+// non-writable memory (can't be a let, Builtin.addressof below requires a var).
+public var _swiftEmptyArrayStorage: (Int, Int, Int, Int) =
+    (/*isa*/0, /*refcount*/-1, /*count*/0, /*flags*/1)
+#endif
+
+/// The storage for static read-only arrays.
+///
+/// In contrast to `_ContiguousArrayStorage` this class is _not_ generic over
+/// the element type, because the metatype for static read-only arrays cannot
+/// be instantiated at runtime.
+///
+/// Static read-only arrays can only contain non-verbatim bridged element types.
+@_fixed_layout
+@usableFromInline
+@_objc_non_lazy_realization
+internal final class __StaticArrayStorage
+  : __ContiguousArrayStorageBase {
+
+  @inlinable
+  @nonobjc
+  internal init(_doNotCallMe: ()) {
+    _internalInvariantFailure("creating instance of __StaticArrayStorage")
+  }
+
+#if _runtime(_ObjC)
+  override internal func _withVerbatimBridgedUnsafeBuffer<R>(
+    _ body: (UnsafeBufferPointer<AnyObject>) throws -> R
+  ) rethrows -> R? {
+    return nil
+  }
+
+  override internal func _getNonVerbatimBridgingBuffer() -> _BridgingBuffer {
+    fatalError("__StaticArrayStorage._withVerbatimBridgedUnsafeBuffer must not be called")
+  }
+#endif
+
+  @inlinable
+  override internal func canStoreElements(ofDynamicType _: Any.Type) -> Bool {
+    return false
+  }
+
+  @inlinable
+  @_unavailableInEmbedded
+  override internal var staticElementType: Any.Type {
+    fatalError("__StaticArrayStorage.staticElementType must not be called")
   }
 }
 
@@ -240,6 +295,7 @@ internal final class _ContiguousArrayStorage<
 
   /// A type that every element in the array is.
   @inlinable
+  @_unavailableInEmbedded
   internal override var staticElementType: Any.Type {
     return Element.self
   }
@@ -295,12 +351,22 @@ internal struct _ContiguousArrayBuffer<Element>: _ArrayBufferProtocol {
       self = _ContiguousArrayBuffer<Element>()
     }
     else {
+      #if !$Embedded
       _storage = Builtin.allocWithTailElems_1(
-         getContiguousArrayStorageType(for: Element.self),
-         realMinimumCapacity._builtinWordValue, Element.self)
+         getContiguousArrayStorageType(for: Element.self), realMinimumCapacity._builtinWordValue, Element.self)
+      #else
+      _storage = Builtin.allocWithTailElems_1(
+         _ContiguousArrayStorage<Element>.self, realMinimumCapacity._builtinWordValue, Element.self)
+      #endif
 
       let storageAddr = UnsafeMutableRawPointer(Builtin.bridgeToRawPointer(_storage))
-      if let allocSize = _mallocSize(ofAllocation: storageAddr) {
+      let allocSize: Int?
+      #if !$Embedded
+      allocSize = _mallocSize(ofAllocation: storageAddr)
+      #else
+      allocSize = nil
+      #endif
+      if let allocSize {
         let endAddr = storageAddr + allocSize
         let realCapacity = endAddr.assumingMemoryBound(to: Element.self) - firstElementAddress
         _initStorageHeader(
@@ -378,10 +444,11 @@ internal struct _ContiguousArrayBuffer<Element>: _ArrayBufferProtocol {
     return firstElementAddress
   }
 
-  /// Call `body(p)`, where `p` is an `UnsafeBufferPointer` over the
-  /// underlying contiguous storage.
-  @inlinable
-  internal func withUnsafeBufferPointer<R>(
+  // Superseded by the typed-throws version of this function, but retained
+  // for ABI reasons.
+  @usableFromInline
+  @_silgen_name("$ss22_ContiguousArrayBufferV010withUnsafeC7Pointeryqd__qd__SRyxGKXEKlF")
+  internal func __abi_withUnsafeBufferPointer<R>(
     _ body: (UnsafeBufferPointer<Element>) throws -> R
   ) rethrows -> R {
     defer { _fixLifetime(self) }
@@ -389,12 +456,35 @@ internal struct _ContiguousArrayBuffer<Element>: _ArrayBufferProtocol {
       count: count))
   }
 
-  /// Call `body(p)`, where `p` is an `UnsafeMutableBufferPointer`
-  /// over the underlying contiguous storage.
-  @inlinable
-  internal mutating func withUnsafeMutableBufferPointer<R>(
+  /// Call `body(p)`, where `p` is an `UnsafeBufferPointer` over the
+  /// underlying contiguous storage.
+  @_alwaysEmitIntoClient
+  internal func withUnsafeBufferPointer<R, E>(
+    _ body: (UnsafeBufferPointer<Element>) throws(E) -> R
+  ) throws(E) -> R {
+    defer { _fixLifetime(self) }
+    return try body(UnsafeBufferPointer(start: firstElementAddress,
+      count: count))
+  }
+
+  // Superseded by the typed-throws version of this function, but retained
+  // for ABI reasons.
+  @usableFromInline
+  @_silgen_name("$ss22_ContiguousArrayBufferV017withUnsafeMutableC7Pointeryqd__qd__SryxGKXEKlF")
+  internal mutating func __abi_withUnsafeMutableBufferPointer<R>(
     _ body: (UnsafeMutableBufferPointer<Element>) throws -> R
   ) rethrows -> R {
+    defer { _fixLifetime(self) }
+    return try body(
+      UnsafeMutableBufferPointer(start: firstElementAddress, count: count))
+  }
+
+  /// Call `body(p)`, where `p` is an `UnsafeMutableBufferPointer`
+  /// over the underlying contiguous storage.
+  @_alwaysEmitIntoClient
+  internal mutating func withUnsafeMutableBufferPointer<R, E>(
+    _ body: (UnsafeMutableBufferPointer<Element>) throws(E) -> R
+  ) throws(E) -> R {
     defer { _fixLifetime(self) }
     return try body(
       UnsafeMutableBufferPointer(start: firstElementAddress, count: count))
@@ -682,8 +772,13 @@ internal struct _ContiguousArrayBuffer<Element>: _ArrayBufferProtocol {
   @inlinable
   internal subscript(bounds: Range<Int>) -> _SliceBuffer<Element> {
     get {
+      #if $Embedded
+      let storage = Builtin.castToNativeObject(_storage)
+      #else
+      let storage = _storage
+      #endif
       return _SliceBuffer(
-        owner: _storage,
+        owner: storage,
         subscriptBaseAddress: firstElementAddress,
         indices: bounds,
         hasNativeBuffer: true)
@@ -696,7 +791,7 @@ internal struct _ContiguousArrayBuffer<Element>: _ArrayBufferProtocol {
   /// Returns `true` if this buffer's storage is uniquely-referenced;
   /// otherwise, returns `false`.
   ///
-  /// This function should only be used for internal sanity checks.
+  /// This function should only be used for internal soundness checks.
   /// To guard a buffer mutation, use `beginCOWMutation`.
   @inlinable
   internal mutating func isUniquelyReferenced() -> Bool {
@@ -827,20 +922,31 @@ internal struct _ContiguousArrayBuffer<Element>: _ArrayBufferProtocol {
       }
       return _storage
     }
+    if _storage is __StaticArrayStorage {
+      return __SwiftDeferredStaticNSArray<Element>(_nativeStorage: _storage)
+    }
     return __SwiftDeferredNSArray(_nativeStorage: _storage)
   }
 #endif
 
+  #if $Embedded
+  public typealias AnyObject = Builtin.NativeObject
+  #endif
+
   /// An object that keeps the elements stored in this buffer alive.
   @inlinable
   internal var owner: AnyObject {
+    #if !$Embedded
     return _storage
+    #else
+    return Builtin.castToNativeObject(_storage)
+    #endif
   }
 
   /// An object that keeps the elements stored in this buffer alive.
   @inlinable
   internal var nativeOwner: AnyObject {
-    return _storage
+    return owner
   }
 
   /// A value that identifies the storage used by the buffer.
@@ -865,6 +971,7 @@ internal struct _ContiguousArrayBuffer<Element>: _ArrayBufferProtocol {
   ///
   /// - Complexity: O(*n*)
   @inlinable
+  @_unavailableInEmbedded
   internal func storesOnlyElementsOfType<U>(
     _: U.Type
   ) -> Bool {
@@ -1135,3 +1242,6 @@ internal struct _UnsafePartiallyInitializedContiguousArrayBuffer<Element> {
     return ContiguousArray(_buffer: finalResult)
   }
 }
+
+@available(*, unavailable)
+extension _UnsafePartiallyInitializedContiguousArrayBuffer: Sendable {}

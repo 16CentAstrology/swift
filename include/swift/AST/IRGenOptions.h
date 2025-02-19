@@ -25,12 +25,15 @@
 #include "swift/Basic/OptimizationMode.h"
 #include "swift/Config.h"
 #include "clang/Basic/PointerAuthOptions.h"
+#include "llvm/IR/CallingConv.h"
 // FIXME: This include is just for llvm::SanitizerCoverageOptions. We should
 // split the header upstream so we don't include so much.
 #include "llvm/Transforms/Instrumentation.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/VersionTuple.h"
+#include <optional>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace swift {
@@ -107,6 +110,9 @@ struct PointerAuthOptions : clang::PointerAuthOptions {
   /// Swift value witness functions.
   PointerAuthSchema ValueWitnesses;
 
+  /// Pointers to Swift value witness tables stored in type metadata.
+  PointerAuthSchema ValueWitnessTable;
+
   /// Swift protocol witness functions.
   PointerAuthSchema ProtocolWitnesses;
 
@@ -115,6 +121,8 @@ struct PointerAuthOptions : clang::PointerAuthOptions {
 
   /// Swift protocol witness table associated conformance witness table
   /// access functions.
+  /// In Embedded Swift used for associated conformance witness table
+  /// pointers.
   PointerAuthSchema ProtocolAssociatedTypeWitnessTableAccessFunctions;
 
   /// Swift class v-table functions.
@@ -146,8 +154,20 @@ struct PointerAuthOptions : clang::PointerAuthOptions {
   /// Protocol conformance descriptors when passed as arguments.
   PointerAuthSchema ProtocolConformanceDescriptorsAsArguments;
 
+  /// Protocol descriptors when passed as arguments.
+  PointerAuthSchema ProtocolDescriptorsAsArguments;
+
+  /// Opaque type descriptors when passed as arguments.
+  PointerAuthSchema OpaqueTypeDescriptorsAsArguments;
+
+  /// Type context descriptors when passed as arguments.
+  PointerAuthSchema ContextDescriptorsAsArguments;
+
   /// Resumption functions from yield-once coroutines.
   PointerAuthSchema YieldOnceResumeFunctions;
+
+  /// Resumption functions from yield-once-2 coroutines.
+  PointerAuthSchema YieldOnce2ResumeFunctions;
 
   /// Resumption functions from yield-many coroutines.
   PointerAuthSchema YieldManyResumeFunctions;
@@ -204,6 +224,12 @@ struct PointerAuthOptions : clang::PointerAuthOptions {
 
   /// C type StoreExtraInhabitantTag function descriminator.
   PointerAuthSchema StoreExtraInhabitantTagFunction;
+
+  /// Relative protocol witness table descriminator.
+  PointerAuthSchema RelativeProtocolWitnessTable;
+
+  /// Type layout string descriminator.
+  PointerAuthSchema TypeLayoutString;
 };
 
 enum class JITDebugArtifact : unsigned {
@@ -221,7 +247,7 @@ public:
   std::string DebugCompilationDir;
 
   /// The DWARF version of debug info.
-  unsigned DWARFVersion;
+  uint8_t DWARFVersion = 4;
 
   /// The command line string that is to be stored in the debug info.
   std::string DebugFlags;
@@ -233,7 +259,7 @@ public:
   SmallVector<LinkLibrary, 4> LinkLibraries;
 
   /// The public dependent libraries specified on the command line.
-  std::vector<std::string> PublicLinkLibraries;
+  std::vector<std::tuple<std::string, bool>> PublicLinkLibraries;
 
   /// If non-empty, the (unmangled) name of a dummy symbol to emit that can be
   /// used to force-load this module.
@@ -246,9 +272,6 @@ public:
   /// well-formed?
   unsigned Verify : 1;
 
-  /// Should we use the legacy pass manager.
-  unsigned LegacyPassManager : 1;
-
   OptimizationMode OptMode;
 
   /// Which sanitizer is turned on.
@@ -259,6 +282,8 @@ public:
 
   /// Whether to enable ODR indicators when building with ASan.
   unsigned SanitizeAddressUseODRIndicator : 1;
+
+  unsigned SanitizerUseStableABI : 1;
 
   /// Path prefixes that should be rewritten in debug info.
   PathRemapper DebugPrefixMap;
@@ -282,7 +307,7 @@ public:
 
   /// Whether we're generating IR for the JIT.
   unsigned UseJIT : 1;
-  
+
   /// Whether we should run LLVM optimizations after IRGen.
   unsigned DisableLLVMOptzns : 1;
 
@@ -312,8 +337,23 @@ public:
   /// Frameworks that we should not autolink against.
   SmallVector<std::string, 1> DisableAutolinkFrameworks;
 
+  /// Non-framework libraries that we should not autolink against.
+  SmallVector<std::string, 1> DisableAutolinkLibraries;
+
+  /// Whether we should disable inserting autolink directives for any frameworks.
+  unsigned DisableFrameworkAutolinking : 1;
+
+  /// Whether we should disable inserting autolink directives altogether.
+  unsigned DisableAllAutolinking : 1;
+
+  /// Whether we should disable inserting __swift_FORCE_LOAD_ symbols.
+  unsigned DisableForceLoadSymbols : 1;
+
   /// Print the LLVM inline tree at the end of the LLVM pass pipeline.
   unsigned PrintInlineTree : 1;
+
+  /// Always recompile the output even if the module hash might match.
+  unsigned AlwaysCompile : 1;
 
   /// Whether we should embed the bitcode file.
   IRGenEmbedMode EmbedMode : 2;
@@ -338,7 +378,7 @@ public:
   /// Force public linkage for private symbols. Used only by the LLDB
   /// expression evaluator.
   unsigned ForcePublicLinkage : 1;
-  
+
   /// Force lazy initialization of class metadata
   /// Used on Windows to avoid cross-module references.
   unsigned LazyInitializeClassMetadata : 1;
@@ -377,6 +417,17 @@ public:
   /// using TypeInfo entries.
   unsigned ForceStructTypeLayouts : 1;
 
+  /// Run a reg2Mem pass after large loadable type lowering.
+  unsigned EnableLargeLoadableTypesReg2Mem : 1;
+
+  /// Enable generation and use of layout string based value witnesses
+  unsigned EnableLayoutStringValueWitnesses : 1;
+
+  /// Enable runtime instantiation of value witness strings for generic types
+  unsigned EnableLayoutStringValueWitnessesInstantiation : 1;
+
+  unsigned EnableObjectiveCProtocolSymbolicReferences : 1;
+
   /// Instrument code to generate profiling information.
   unsigned GenerateProfile : 1;
 
@@ -389,7 +440,7 @@ public:
   /// Whether to disable shadow copies for local variables on the stack. This is
   /// only used for testing.
   unsigned DisableDebuggerShadowCopies : 1;
-  
+
   /// Whether to disable using mangled names for accessing concrete type metadata.
   unsigned DisableConcreteTypeMetadataMangledNameAccessors : 1;
 
@@ -410,6 +461,8 @@ public:
   /// Internalize symbols (static library) - do not export any public symbols.
   unsigned InternalizeSymbols : 1;
 
+  unsigned MergeableSymbols : 1;
+
   /// Emit a section with references to class_ro_t* in generic class patterns.
   unsigned EmitGenericRODatas : 1;
 
@@ -422,11 +475,40 @@ public:
   /// Collocate metadata functions in their own section.
   unsigned CollocatedMetadataFunctions : 1;
 
+  /// Colocate type descriptors in their own section.
+  unsigned ColocateTypeDescriptors : 1;
+
+  /// Use relative (and constant) protocol witness tables.
+  unsigned UseRelativeProtocolWitnessTables : 1;
+
+  unsigned UseFragileResilientProtocolWitnesses : 1;
+
+  // Whether to run the HotColdSplitting pass when optimizing.
+  unsigned EnableHotColdSplit : 1;
+
+  unsigned EmitAsyncFramePushPopMetadata : 1;
+
+  // Whether to use the yield_once ABI when emitting yield_once_2 coroutines.
+  unsigned EmitYieldOnce2AsYieldOnce : 1;
+
+  // Whether to force emission of a frame for all async functions
+  // (LLVM's 'frame-pointer=all').
+  unsigned AsyncFramePointerAll : 1;
+
+  unsigned UseProfilingMarkerThunks : 1;
+
   /// The number of threads for multi-threaded code generation.
   unsigned NumThreads = 0;
 
   /// Path to the profdata file to be used for PGO, or the empty string.
   std::string UseProfile = "";
+
+  /// Path to the data file to be used for sampling-based PGO,
+  /// or the empty string.
+  std::string UseSampleProfile = "";
+
+  /// Controls whether DWARF discriminators are added to the IR.
+  unsigned DebugInfoForProfiling : 1;
 
   /// List of backend command-line options for -embed-bitcode.
   std::vector<uint8_t> CmdArgs;
@@ -445,11 +527,12 @@ public:
   };
 
   TypeInfoDumpFilter TypeInfoFilter;
-  
+
   /// Pull in runtime compatibility shim libraries by autolinking.
-  Optional<llvm::VersionTuple> AutolinkRuntimeCompatibilityLibraryVersion;
-  Optional<llvm::VersionTuple> AutolinkRuntimeCompatibilityDynamicReplacementLibraryVersion;
-  Optional<llvm::VersionTuple>
+  std::optional<llvm::VersionTuple> AutolinkRuntimeCompatibilityLibraryVersion;
+  std::optional<llvm::VersionTuple>
+      AutolinkRuntimeCompatibilityDynamicReplacementLibraryVersion;
+  std::optional<llvm::VersionTuple>
       AutolinkRuntimeCompatibilityConcurrencyLibraryVersion;
   bool AutolinkRuntimeCompatibilityBytecodeLayoutsLibrary;
 
@@ -459,20 +542,34 @@ public:
   /// function instead of to trap instructions.
   std::string TrapFuncName = "";
 
+  /// The calling convention used to perform non-swift calls.
+  llvm::CallingConv::ID PlatformCCallingConvention;
+
+  /// Use CAS based object format as the output.
+  bool UseCASBackend = false;
+
+  /// The output mode for the CAS Backend.
+  llvm::CASBackendMode CASObjMode;
+
+  /// Emit a .casid file next to the object file if CAS Backend is used.
+  bool EmitCASIDFile = false;
+
+  /// Paths to the pass plugins registered via -load-pass-plugin.
+  std::vector<std::string> LLVMPassPlugins;
+
   IRGenOptions()
-      : DWARFVersion(2),
-        OutputKind(IRGenOutputKind::LLVMAssemblyAfterOptimization),
-        Verify(true), LegacyPassManager(0), OptMode(OptimizationMode::NotSet),
+      : OutputKind(IRGenOutputKind::LLVMAssemblyAfterOptimization),
+        Verify(true), OptMode(OptimizationMode::NotSet),
         Sanitizers(OptionSet<SanitizerKind>()),
         SanitizersWithRecoveryInstrumentation(OptionSet<SanitizerKind>()),
-        SanitizeAddressUseODRIndicator(false),
+        SanitizeAddressUseODRIndicator(false), SanitizerUseStableABI(false),
         DebugInfoLevel(IRGenDebugInfoLevel::None),
         DebugInfoFormat(IRGenDebugInfoFormat::None),
         DisableClangModuleSkeletonCUs(false), UseJIT(false),
         DisableLLVMOptzns(false), DisableSwiftSpecificLLVMOptzns(false),
-        Playground(false),
-        EmitStackPromotionChecks(false), UseSingleModuleLLVMEmission(false),
-        FunctionSections(false), PrintInlineTree(false),
+        Playground(false), EmitStackPromotionChecks(false),
+        UseSingleModuleLLVMEmission(false), FunctionSections(false),
+        PrintInlineTree(false), AlwaysCompile(false),
         EmbedMode(IRGenEmbedMode::None), LLVMLTOKind(IRGenLLVMLTOKind::None),
         SwiftAsyncFramePointer(SwiftAsyncFramePointerKind::Auto),
         HasValueNamesSetting(false), ValueNames(false),
@@ -484,6 +581,10 @@ public:
         CompactAbsoluteFunctionPointer(false), DisableLegacyTypeInfo(false),
         PrespecializeGenericMetadata(false), UseIncrementalLLVMCodeGen(true),
         UseTypeLayoutValueHandling(true), ForceStructTypeLayouts(false),
+        EnableLargeLoadableTypesReg2Mem(true),
+        EnableLayoutStringValueWitnesses(false),
+        EnableLayoutStringValueWitnessesInstantiation(false),
+        EnableObjectiveCProtocolSymbolicReferences(true),
         GenerateProfile(false), EnableDynamicReplacementChaining(false),
         DisableDebuggerShadowCopies(false),
         DisableConcreteTypeMetadataMangledNameAccessors(false),
@@ -491,11 +592,18 @@ public:
         EnableGlobalISel(false), VirtualFunctionElimination(false),
         WitnessMethodElimination(false), ConditionalRuntimeRecords(false),
         InternalizeAtLink(false), InternalizeSymbols(false),
-        EmitGenericRODatas(false), NoPreallocatedInstantiationCaches(false),
-        DisableReadonlyStaticObjects(false),
-        CollocatedMetadataFunctions(false), CmdArgs(),
+        MergeableSymbols(false),
+        EmitGenericRODatas(true), NoPreallocatedInstantiationCaches(false),
+        DisableReadonlyStaticObjects(false), CollocatedMetadataFunctions(false),
+        ColocateTypeDescriptors(true), UseRelativeProtocolWitnessTables(false),
+        UseFragileResilientProtocolWitnesses(false), EnableHotColdSplit(false),
+        EmitAsyncFramePushPopMetadata(true), EmitYieldOnce2AsYieldOnce(true),
+        AsyncFramePointerAll(false), UseProfilingMarkerThunks(false),
+        DebugInfoForProfiling(false), CmdArgs(),
         SanitizeCoverage(llvm::SanitizerCoverageOptions()),
-        TypeInfoFilter(TypeInfoDumpFilter::All) {
+        TypeInfoFilter(TypeInfoDumpFilter::All),
+        PlatformCCallingConvention(llvm::CallingConv::C), UseCASBackend(false),
+        CASObjMode(llvm::CASBackendMode::Native) {
 #ifndef NDEBUG
     DisableRoundTripDebugTypes = false;
 #else
@@ -538,13 +646,26 @@ public:
     return OptMode == OptimizationMode::ForSize;
   }
 
-  std::string getDebugFlags(StringRef PrivateDiscriminator) const {
+  std::string getDebugFlags(StringRef PrivateDiscriminator,
+                            bool EnableCXXInterop,
+                            bool EnableEmbeddedSwift) const {
     std::string Flags = DebugFlags;
     if (!PrivateDiscriminator.empty()) {
       if (!Flags.empty())
         Flags += " ";
       Flags += ("-private-discriminator " + PrivateDiscriminator).str();
     }
+    if (EnableCXXInterop) {
+      if (!Flags.empty())
+        Flags += " ";
+      Flags += "-enable-experimental-cxx-interop";
+    }
+    if (EnableEmbeddedSwift) {
+      if (!Flags.empty())
+        Flags += " ";
+      Flags += "-enable-embedded-swift";
+    }
+
     return Flags;
   }
 
@@ -563,6 +684,10 @@ public:
   bool hasMultipleIRGenThreads() const { return !UseSingleModuleLLVMEmission && NumThreads > 1; }
   bool shouldPerformIRGenerationInParallel() const { return !UseSingleModuleLLVMEmission && NumThreads != 0; }
   bool hasMultipleIGMs() const { return hasMultipleIRGenThreads(); }
+
+  bool isDebugInfoCodeView() const {
+    return DebugInfoFormat == IRGenDebugInfoFormat::CodeView;
+  }
 };
 
 } // end namespace swift

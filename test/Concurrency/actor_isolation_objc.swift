@@ -1,6 +1,11 @@
-// RUN: %target-typecheck-verify-swift  -disable-availability-checking
+// RUN: %target-swift-frontend -target %target-swift-5.1-abi-triple %s -emit-sil -o /dev/null -verify
+// RUN: %target-swift-frontend -target %target-swift-5.1-abi-triple %s -emit-sil -o /dev/null -verify -strict-concurrency=targeted
+// RUN: %target-swift-frontend -target %target-swift-5.1-abi-triple %s -emit-sil -o /dev/null -verify -strict-concurrency=complete
+// RUN: %target-swift-frontend -target %target-swift-5.1-abi-triple %s -emit-sil -o /dev/null -verify -strict-concurrency=complete -enable-upcoming-feature RegionBasedIsolation
+
 // REQUIRES: concurrency
 // REQUIRES: objc_interop
+// REQUIRES: swift_feature_RegionBasedIsolation
 
 import Foundation
 
@@ -59,3 +64,8 @@ actor Dril: NSObject {
 
 // makes sure the synthesized init's delegation kind is determined correctly.
 actor Pumpkin: NSObject {}
+
+actor Bad {
+  @objc nonisolated lazy var invalid = 0
+  // expected-warning@-1 {{'nonisolated' is not supported on lazy properties; this is an error in the Swift 6 language mode}}
+}

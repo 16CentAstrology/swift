@@ -85,7 +85,7 @@ typealias Foo = some P // expected-error{{'some' types are only permitted}}
 
 func blibble(blobble: some P) {}
 func blib() -> P & some Q { return 1 } // expected-error{{'some' should appear at the beginning}}
-func blab() -> some P? { return 1 } // expected-error{{must specify only}} expected-note{{did you mean to write an optional of an 'opaque' type?}}
+func blab() -> some P? { return 1 } // expected-error{{must specify only}} expected-note{{did you mean to write an optional of an 'some' type?}}
 func blorb<T: some P>(_: T) { } // expected-error{{'some' types are only permitted}}
 func blub<T>() -> T where T == some P { return 1 } // expected-error{{'some' types are only permitted}}
 
@@ -273,11 +273,9 @@ func associatedTypeIdentity() {
   sameType(cr, dr) // expected-error {{conflicting arguments to generic parameter 'T' ('(some R).S' (result type of 'candace') vs. '(some R).S' (result type of 'doug'))}}
   sameType(gary(candace()).r_out(), gary(candace()).r_out())
   sameType(gary(doug()).r_out(), gary(doug()).r_out())
-  // TODO(diagnostics): This is not great but the problem comes from the way solver discovers and attempts bindings, if we could detect that
-  // `(some R).S` from first reference to `gary()` in inconsistent with the second one based on the parent type of `S` it would be much easier to diagnose.
   sameType(gary(doug()).r_out(), gary(candace()).r_out())
-  // expected-error@-1:12 {{conflicting arguments to generic parameter 'T' ('some R' (result type of 'doug') vs. 'some R' (result type of 'candace'))}}
-  // expected-error@-2:34 {{conflicting arguments to generic parameter 'T' ('some R' (result type of 'doug') vs. 'some R' (result type of 'candace'))}}
+  // expected-error@-1 {{conflicting arguments to generic parameter 'T' ('some R' (result type of 'doug') vs. 'some R' (result type of 'candace'))}}
+  // expected-error@-2 {{conflicting arguments to generic parameter 'T' ('some R' (result type of 'doug') vs. 'some R' (result type of 'candace'))}}
 }
 
 func redeclaration() -> some P { return 0 } // expected-note 2{{previously declared}}
@@ -576,5 +574,45 @@ do {
     // expected-error@-1 {{function declares an opaque return type, but has no return statements in its body from which to infer an underlying type}}
     let x = invalid // expected-error {{cannot find 'invalid' in scope}}
     x
+  }
+}
+
+// https://github.com/apple/swift/issues/62787
+func f62787() -> Optional<some Collection<Int>> {
+  return nil // expected-error{{underlying type for opaque result type 'Optional<some Collection<Int>>' could not be inferred from return expression}}
+}
+
+func f62787_1(x: Bool) -> Optional<some Collection<Int>> {
+  if x {
+    return nil // expected-error{{underlying type for opaque result type 'Optional<some Collection<Int>>' could not be inferred from return expression}}
+  } 
+  return nil // expected-error{{underlying type for opaque result type 'Optional<some Collection<Int>>' could not be inferred from return expression}}
+}
+
+// rdar://124482122 - Make sure that constraints are respected by opaque types
+protocol P3<A> {
+  associatedtype A: P1
+}
+
+do {
+  struct G<A: P1>: P3 {}
+
+  struct S: P1 {}
+
+  class A {}
+
+  func test1() -> some P3<Int> { // expected-note {{opaque return type declared here}}
+    return G<S>()
+    // expected-error@-1 {{return type of local function 'test1()' requires the types 'S' and 'Int' be equivalent}}
+  }
+
+  func test2() -> some P3<G<S>> { // expected-note {{opaque return type declared here}}
+    return G<S>()
+    // expected-error@-1 {{return type of local function 'test2()' requires the types 'S' and 'G<S>' be equivalent}}
+  }
+
+  func test3() -> some P1 & A { // expected-note {{opaque return type declared here}}
+    S()
+    // expected-error@-1 {{return type of local function 'test3()' requires that 'S' inherit from 'A'}}
   }
 }

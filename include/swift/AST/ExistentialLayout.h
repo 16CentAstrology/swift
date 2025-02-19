@@ -10,7 +10,11 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This file defines the ExistentialLayout struct.
+// The ExistentialLayout struct describes the in-memory layout of an existential
+// type.
+//
+// It flattens and canonicalizes protocol compositions, and also expands defaults
+// for invertible protocols.
 //
 //===----------------------------------------------------------------------===//
 
@@ -31,8 +35,9 @@ struct ExistentialLayout {
 
   ExistentialLayout() {
     hasExplicitAnyObject = false;
-    containsNonObjCProtocol = false;
-    containsParameterized = false;
+    containsObjCProtocol = false;
+    containsSwiftProtocol = false;
+    representsAnyObject = false;
   }
 
   ExistentialLayout(CanProtocolType type);
@@ -45,11 +50,14 @@ struct ExistentialLayout {
   /// Whether the existential contains an explicit '& AnyObject' constraint.
   bool hasExplicitAnyObject : 1;
 
-  /// Whether any protocol members are non-@objc.
-  bool containsNonObjCProtocol : 1;
+  /// Whether any protocol members are @objc.
+  bool containsObjCProtocol : 1;
 
-  /// Whether any protocol members are parameterized.s
-  bool containsParameterized : 1;
+  /// Whether any protocol members require a witness table.
+  bool containsSwiftProtocol : 1;
+
+  /// Whether this layout is the canonical layout for plain-old 'AnyObject'.
+  bool representsAnyObject : 1;
 
   /// Return the kind of this existential (class/error/opaque).
   Kind getKind() {
@@ -64,14 +72,14 @@ struct ExistentialLayout {
     return Kind::Opaque;
   }
 
-  bool isAnyObject() const;
+  bool isAnyObject() const { return representsAnyObject; }
 
   bool isObjC() const {
     // FIXME: Does the superclass have to be @objc?
     return ((explicitSuperclass ||
              hasExplicitAnyObject ||
-             !getProtocols().empty()) &&
-            !containsNonObjCProtocol);
+             containsObjCProtocol) &&
+            !containsSwiftProtocol);
   }
 
   /// Whether the existential requires a class, either via an explicit
@@ -97,14 +105,18 @@ struct ExistentialLayout {
   /// calling this on a temporary is likely to be incorrect.
   ArrayRef<ProtocolDecl*> getProtocols() const && = delete;
 
+  ArrayRef<ParameterizedProtocolType *> getParameterizedProtocols() const & {
+    return parameterized;
+  }
+  /// The returned ArrayRef points to internal storage, so
+  /// calling this on a temporary is likely to be incorrect.
+  ArrayRef<ProtocolDecl*> getParameterizedProtocols() const && = delete;
+
   LayoutConstraint getLayoutConstraint() const;
 
 private:
   SmallVector<ProtocolDecl *, 4> protocols;
-
-  /// Zero or more primary associated type requirements from a
-  /// ParameterizedProtocolType
-  ArrayRef<Type> sameTypeRequirements;
+  SmallVector<ParameterizedProtocolType *, 4> parameterized;
 };
 
 }

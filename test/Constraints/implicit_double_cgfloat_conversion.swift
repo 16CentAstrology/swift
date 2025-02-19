@@ -217,7 +217,7 @@ func test_multi_argument_conversion_with_optional(d: Double, cgf: CGFloat) {
   test(cgf, d) // Ok (CGFloat -> Double and Double? -> CGFloat?)
 }
 
-extension CGFloat: Hashable {
+extension CGFloat: @retroactive Hashable {
   public func hash(into hasher: inout Hasher) { fatalError() }
 }
 
@@ -341,4 +341,9 @@ func test_init_validation() {
       // CHECK: function_ref @$s12CoreGraphics7CGFloatVyACSdcfC : $@convention(method) (Double, @thin CGFloat.Type) -> CGFloat
     }
   }
+}
+
+// Optional-to-optional conversion
+func optional_to_optional(x: CGFloat?) -> Double? {
+  return x
 }

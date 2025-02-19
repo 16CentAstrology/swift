@@ -10,6 +10,8 @@
 //
 //===----------------------------------------------------------------------===//
 
+#if !$Embedded
+
 /// A unique identifier for a class instance or metatype.
 ///
 /// This unique identifier is only valid for comparisons during the lifetime
@@ -57,13 +59,35 @@ public struct ObjectIdentifier: Sendable {
 
   /// Creates an instance that uniquely identifies the given metatype.
   ///
-  /// - Parameter: A metatype.
+  /// - Parameters:
+  ///   - x: A metatype.
   @inlinable // trivial-implementation
   public init(_ x: Any.Type) {
     self._value = unsafeBitCast(x, to: Builtin.RawPointer.self)
   }
 }
 
+#else
+
+@frozen // trivial-implementation
+public struct ObjectIdentifier: Sendable {
+  @usableFromInline // trivial-implementation
+  internal let _value: Builtin.RawPointer
+
+  @inlinable // trivial-implementation
+  public init<Object: AnyObject>(_ x: Object) {
+    self._value = Builtin.bridgeToRawPointer(x)
+  }
+
+  @inlinable // trivial-implementation
+  public init<Object>(_ x: Object.Type) {
+    self._value = unsafeBitCast(x, to: Builtin.RawPointer.self)
+  }
+}
+
+#endif
+
+@_unavailableInEmbedded
 extension ObjectIdentifier: CustomDebugStringConvertible {
   /// A textual representation of the identifier, suitable for debugging.
   public var debugDescription: String {

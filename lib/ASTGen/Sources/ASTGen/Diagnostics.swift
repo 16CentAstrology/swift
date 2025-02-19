@@ -1,124 +1,167 @@
-import CASTBridging
+//===--- Diagnostics.swift ------------------------------------------------===//
+//
+// This source file is part of the Swift.org open source project
+//
+// Copyright (c) 2023 Apple Inc. and the Swift project authors
+// Licensed under Apache License v2.0 with Runtime Library Exception
+//
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+//
+//===----------------------------------------------------------------------===//
+
 import SwiftDiagnostics
 import SwiftSyntax
 
-fileprivate func emitDiagnosticParts(
-  diagEnginePtr: UnsafeMutablePointer<UInt8>,
-  sourceFileBuffer: UnsafeMutableBufferPointer<UInt8>,
-  message: String,
-  severity: DiagnosticSeverity,
-  position: AbsolutePosition,
-  highlights: [Syntax] = [],
-  fixItChanges: [FixIt.Change] = []
-) {
-  // Map severity
-  let bridgedSeverity: BridgedDiagnosticSeverity
-  switch severity {
-    case .error: bridgedSeverity = .error
-    case .note: bridgedSeverity = .note
-    case .warning: bridgedSeverity = .warning
+extension ASTGenVisitor {
+  /// Emits the given ASTGen diagnostic via the C++ diagnostic engine.
+  func diagnose(_ message: ASTGenDiagnostic, highlights: [Syntax]? = nil, notes: [Note] = [], fixIts: [FixIt] = []) {
+    self.diagnose(Diagnostic(
+      node: message.node,
+      message: message,
+      highlights: highlights,
+      notes: notes,
+      fixIts: fixIts
+    ))
   }
 
-  // Form a source location for the given absolute position
-  func sourceLoc(
-    at position: AbsolutePosition
-  ) -> UnsafeMutablePointer<UInt8>? {
-    if let sourceFileBase = sourceFileBuffer.baseAddress,
-      position.utf8Offset >= 0 &&
-        position.utf8Offset < sourceFileBuffer.count {
-      return sourceFileBase + position.utf8Offset
-    }
-
-    return nil
-  }
-
-  // Emit the diagnostic
-  var mutableMessage = message
-  let diag = mutableMessage.withUTF8 { messageBuffer in
-    SwiftDiagnostic_create(
-      diagEnginePtr, bridgedSeverity, sourceLoc(at: position),
-      messageBuffer.baseAddress, messageBuffer.count
+  /// Emits the given diagnostic via the C++ diagnostic engine.
+  func diagnose(_ diagnostic: Diagnostic) {
+    emitDiagnostic(
+      diagnosticEngine: self.diagnosticEngine,
+      sourceFileBuffer: self.base,
+      diagnostic: diagnostic,
+      diagnosticSeverity: diagnostic.diagMessage.severity
     )
   }
 
-  // Emit highlights
-  for highlight in highlights {
-    SwiftDiagnostic_highlight(
-      diag, sourceLoc(at: highlight.position),
-      sourceLoc(at: highlight.endPosition)
-    )
+  /// Emits the given diagnostics via the C++ diagnostic engine.
+  func diagnoseAll(_ diagnostics: [Diagnostic]) {
+    diagnostics.forEach(diagnose)
   }
-
-  // Emit changes for a Fix-It.
-  for change in fixItChanges {
-    let replaceStartLoc: UnsafeMutablePointer<UInt8>?
-    let replaceEndLoc: UnsafeMutablePointer<UInt8>?
-    var newText: String
-
-    switch change {
-    case .replace(let oldNode, let newNode):
-      replaceStartLoc = sourceLoc(at: oldNode.position)
-      replaceEndLoc = sourceLoc(at: oldNode.endPosition)
-      newText = newNode.description
-
-    case .replaceLeadingTrivia(let oldToken, let newTrivia):
-      replaceStartLoc = sourceLoc(at: oldToken.position)
-      replaceEndLoc = sourceLoc(
-        at: oldToken.positionAfterSkippingLeadingTrivia)
-      newText = newTrivia.description
-
-    case .replaceTrailingTrivia(let oldToken, let newTrivia):
-      replaceStartLoc = sourceLoc(at: oldToken.endPositionBeforeTrailingTrivia)
-      replaceEndLoc = sourceLoc(at: oldToken.endPosition)
-      newText = newTrivia.description
-    }
-
-    newText.withUTF8 { textBuffer in
-      SwiftDiagnostic_fixItReplace(
-        diag, replaceStartLoc, replaceEndLoc,
-        textBuffer.baseAddress, textBuffer.count
-      )
-    }
-  }
-
-  SwiftDiagnostic_finish(diag);
 }
 
-/// Emit the given diagnostic via the diagnostic engine.
-func emitDiagnostic(
-  diagEnginePtr: UnsafeMutablePointer<UInt8>,
-  sourceFileBuffer: UnsafeMutableBufferPointer<UInt8>,
-  diagnostic: Diagnostic,
-  messageSuffix: String? = nil
-) {
-  // Emit the main diagnostic
-  emitDiagnosticParts(
-    diagEnginePtr: diagEnginePtr,
-    sourceFileBuffer: sourceFileBuffer,
-    message: diagnostic.diagMessage.message + (messageSuffix ?? ""),
-    severity: diagnostic.diagMessage.severity,
-    position: diagnostic.position,
-    highlights: diagnostic.highlights
-  )
+struct ASTGenDiagnostic: DiagnosticMessage {
+  var node: Syntax
+  var message: String
+  var severity: DiagnosticSeverity
+  var messageID: String
 
-  // Emit Fix-Its.
-  for fixIt in diagnostic.fixIts {
-    emitDiagnosticParts(
-        diagEnginePtr: diagEnginePtr,
-        sourceFileBuffer: sourceFileBuffer,
-        message: fixIt.message.message,
-        severity: .note, position: diagnostic.position,
-        fixItChanges: fixIt.changes.changes
+  var diagnosticID: MessageID {
+    MessageID(domain: "ASTGen", id: messageID)
+  }
+
+  init(node: some SyntaxProtocol, message: String, severity: DiagnosticSeverity = .error, messageID: String) {
+    self.node = Syntax(node)
+    self.message = message
+    self.severity = severity
+    self.messageID = messageID
+  }
+
+  fileprivate init(node: some SyntaxProtocol, message: String, severity: DiagnosticSeverity = .error, function: String = #function) {
+    // Extract messageID from the function name.
+    let messageID = String(function.prefix(while: { $0 != "(" }))
+    self.init(node: node, message: message, severity: severity, messageID: messageID)
+  }
+}
+
+extension ASTGenDiagnostic {
+  /// An error emitted when a token is of an unexpected kind.
+  static func unexpectedTokenKind(token: TokenSyntax) -> Self {
+    guard let parent = token.parent else {
+      preconditionFailure("Expected a child (not a root) token")
+    }
+
+    return Self(
+      node: token,
+      message: """
+      unexpected token kind for token:
+        \(token.debugDescription)
+      in parent:
+        \(parent.debugDescription(indentString: "  "))
+      """
     )
   }
 
-  // Emit any notes as follow-ons.
-  for note in diagnostic.notes {
-    emitDiagnosticParts(
-      diagEnginePtr: diagEnginePtr,
-      sourceFileBuffer: sourceFileBuffer,
-      message: note.message,
-      severity: .note, position: note.position
+  /// An error emitted when an optional child token is unexpectedly nil.
+  static func missingChildToken(parent: some SyntaxProtocol, kindOfTokenMissing: TokenKind) -> Self {
+    Self(
+      node: parent,
+      message: """
+      missing child token of kind '\(kindOfTokenMissing)' in:
+        \(parent.debugDescription(indentString: "  "))
+      """
+    )
+  }
+
+  /// An error emitted when a syntax collection entry is encountered that is
+  /// considered a duplicate of a previous entry per the language grammar.
+  static func duplicateSyntax(duplicate: some SyntaxProtocol, original: some SyntaxProtocol) -> Self {
+    precondition(duplicate.kind == original.kind, "Expected duplicate and original to be of same kind")
+
+    guard let duplicateParent = duplicate.parent, let originalParent = original.parent,
+      duplicateParent == originalParent, duplicateParent.kind.isSyntaxCollection
+    else {
+      preconditionFailure("Expected a shared syntax collection parent")
+    }
+
+    return Self(
+      node: duplicate,
+      message: """
+      unexpected duplicate syntax in list:
+        \(duplicate.debugDescription(indentString: "  "))
+      previous syntax:
+        \(original.debugDescription(indentString: "  "))
+      """
+    )
+  }
+
+  static func nonTrivialPatternForAccessor(_ pattern: some SyntaxProtocol) -> Self {
+    Self(
+      node: pattern,
+      message: "getter/setter can only be defined for a single variable"
+    )
+  }
+
+  static func unknownAccessorSpecifier(_ specifier: TokenSyntax) -> Self {
+    Self(
+      node: specifier,
+      message: "unknown accessor specifier '\(specifier.text)'"
+    )
+  }
+}
+
+/// Decl diagnostics
+extension ASTGenDiagnostic {
+  static func illegalTopLevelStmt(_ stmt: some SyntaxProtocol) -> Self {
+    Self(
+      node: stmt,
+      message: "statements are not allowed at the top level"
+    )
+  }
+
+  static func illegalTopLevelExpr(_ expr: some SyntaxProtocol) -> Self {
+    Self(
+      node: expr,
+      message: "expressions are not allowed at the top level"
+    )
+  }
+}
+
+/// DeclAttributes diagnostics
+extension ASTGenDiagnostic {
+  static func expectedArgumentsInAttribute(_ attribute: AttributeSyntax) -> Self {
+    // FIXME: The diagnostic position should be at the and of the attribute name.
+    Self(
+      node: attribute,
+      message: "expected arguments for '\(attribute.attributeName.trimmedDescription)' attribute"
+    )
+  }
+
+  static func extraneousArgumentsInAttribute(_ attribute: AttributeSyntax, _ extra: some SyntaxProtocol) -> Self {
+    Self(
+      node: extra,
+      message: "unexpected arguments in '\(attribute.attributeName.trimmedDescription)' attribute"
     )
   }
 }

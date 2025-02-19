@@ -34,6 +34,7 @@
 /// For more information about using arrays, see `Array` and `ArraySlice`, with
 /// which `ContiguousArray` shares most properties and methods.
 @frozen
+@_eagerMove
 public struct ContiguousArray<Element>: _DestructorSafeContainer {
   @usableFromInline
   internal typealias _Buffer = _ContiguousArrayBuffer<Element>
@@ -52,6 +53,7 @@ public struct ContiguousArray<Element>: _DestructorSafeContainer {
 //===--- private helpers---------------------------------------------------===//
 extension ContiguousArray {
   @inlinable
+  @inline(__always)
   @_semantics("array.get_count")
   internal func _getCount() -> Int {
     return _buffer.immutableCount
@@ -145,6 +147,10 @@ extension ContiguousArray: _ArrayProtocol {
     return _getCapacity()
   }
 
+  #if $Embedded
+  public typealias AnyObject = Builtin.NativeObject
+  #endif
+
   /// An object that guarantees the lifetime of this array's elements.
   @inlinable
   public // @testable
@@ -203,6 +209,7 @@ extension ContiguousArray: RandomAccessCollection, MutableCollection {
   /// If the array is empty, `endIndex` is equal to `startIndex`.
   public var endIndex: Int {
     @inlinable
+    @inline(__always)
     get {
       return _getCount()
     }
@@ -972,8 +979,11 @@ extension ContiguousArray: RangeReplaceableCollection {
     if !keepCapacity {
       _buffer = _Buffer()
     }
-    else {
+    else if _buffer.isMutableAndUniquelyReferenced() {
       self.replaceSubrange(indices, with: EmptyCollection())
+    }
+    else {
+      _buffer = _Buffer(_uninitializedCount: 0, minimumCapacity: capacity)
     }
   }
 
@@ -1031,6 +1041,7 @@ extension ContiguousArray: CustomReflectable {
 }
 #endif
 
+@_unavailableInEmbedded
 extension ContiguousArray: CustomStringConvertible, CustomDebugStringConvertible {
   /// A textual representation of the array and its elements.
   public var description: String {
@@ -1094,6 +1105,16 @@ extension ContiguousArray {
       initializingWith: initializer))
   }
 
+  // Superseded by the typed-throws version of this function, but retained
+  // for ABI reasons.
+  @usableFromInline
+  @_disfavoredOverload
+  func withUnsafeBufferPointer<R>(
+    _ body: (UnsafeBufferPointer<Element>) throws -> R
+  ) rethrows -> R {
+    return try _buffer.withUnsafeBufferPointer(body)
+  }
+
   /// Calls a closure with a pointer to the array's contiguous storage.
   ///
   /// Often, the optimizer can eliminate bounds checks within an array
@@ -1123,11 +1144,23 @@ extension ContiguousArray {
   ///   for the `withUnsafeBufferPointer(_:)` method. The pointer argument is
   ///   valid only for the duration of the method's execution.
   /// - Returns: The return value, if any, of the `body` closure parameter.
-  @inlinable
-  public func withUnsafeBufferPointer<R>(
-    _ body: (UnsafeBufferPointer<Element>) throws -> R
-  ) rethrows -> R {
+  @_alwaysEmitIntoClient
+  public func withUnsafeBufferPointer<R, E>(
+    _ body: (UnsafeBufferPointer<Element>) throws(E) -> R
+  ) throws(E) -> R {
     return try _buffer.withUnsafeBufferPointer(body)
+  }
+
+  // Superseded by the typed-throws version of this function, but retained
+  // for ABI reasons.
+  @_semantics("array.withUnsafeMutableBufferPointer")
+  @usableFromInline
+  @inline(__always)
+  @_silgen_name("$ss15ContiguousArrayV30withUnsafeMutableBufferPointeryqd__qd__SryxGzKXEKlF")
+  mutating func __abi_withUnsafeMutableBufferPointer<R>(
+    _ body: (inout UnsafeMutableBufferPointer<Element>) throws -> R
+  ) rethrows -> R {
+    return try withUnsafeMutableBufferPointer(body)
   }
 
   /// Calls the given closure with a pointer to the array's mutable contiguous
@@ -1167,14 +1200,14 @@ extension ContiguousArray {
   ///   method's execution.
   /// - Returns: The return value, if any, of the `body` closure parameter.
   @_semantics("array.withUnsafeMutableBufferPointer")
-  @inlinable // FIXME(inline-always)
+  @_alwaysEmitIntoClient
   @inline(__always) // Performance: This method should get inlined into the
   // caller such that we can combine the partial apply with the apply in this
   // function saving on allocating a closure context. This becomes unnecessary
   // once we allocate noescape closures on the stack.
-  public mutating func withUnsafeMutableBufferPointer<R>(
-    _ body: (inout UnsafeMutableBufferPointer<Element>) throws -> R
-  ) rethrows -> R {
+  public mutating func withUnsafeMutableBufferPointer<R, E>(
+    _ body: (inout UnsafeMutableBufferPointer<Element>) throws(E) -> R
+  ) throws(E) -> R {
     _makeMutableAndUnique()
     let count = _buffer.mutableCount
 

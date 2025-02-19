@@ -19,8 +19,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "CodeSynthesis.h"
+#include "DerivedConformances.h"
 #include "TypeChecker.h"
-#include "swift/Strings.h"
+#include "swift/AST/AvailabilityInference.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/GenericSignature.h"
@@ -30,7 +31,7 @@
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/Stmt.h"
 #include "swift/AST/Types.h"
-#include "DerivedConformances.h"
+#include "swift/Strings.h"
 
 using namespace swift;
 
@@ -73,14 +74,14 @@ static Expr *constructUnownedSerialExecutor(ASTContext &ctx,
     auto selfApply = ConstructorRefCallExpr::create(ctx, initRef, metatypeRef,
                                                     ctorAppliedType);
     selfApply->setImplicit(true);
-    selfApply->setThrows(false);
+    selfApply->setThrows(nullptr);
 
     // Call the constructor, building an expression of type
     // UnownedSerialExecutor.
     auto *argList = ArgumentList::forImplicitUnlabeled(ctx, {arg});
     auto call = CallExpr::createImplicit(ctx, selfApply, argList);
     call->setType(executorType);
-    call->setThrows(false);
+    call->setThrows(nullptr);
     return call;
   }
 
@@ -104,7 +105,7 @@ deriveBodyActor_unownedExecutor(AbstractFunctionDecl *getter, void *) {
   };
 
   // Build a reference to self.
-  Type selfType = getter->getImplicitSelfDecl()->getType();
+  Type selfType = getter->getImplicitSelfDecl()->getTypeInContext();
   Expr *selfArg = DerivedConformance::createSelfDeclRef(getter);
   selfArg->setType(selfType);
 
@@ -112,13 +113,13 @@ deriveBodyActor_unownedExecutor(AbstractFunctionDecl *getter, void *) {
   auto builtinCall =
     DerivedConformance::createBuiltinCall(ctx,
                         BuiltinValueKind::BuildDefaultActorExecutorRef,
-                                          {selfType}, {}, {selfArg});
+                                          {selfType}, {selfArg});
 
   // Turn that into an UnownedSerialExecutor.
   auto initCall = constructUnownedSerialExecutor(ctx, builtinCall);
   if (!initCall) return failure();
 
-  auto ret = new (ctx) ReturnStmt(SourceLoc(), initCall, /*implicit*/ true);
+  auto *ret = ReturnStmt::createImplicit(ctx, initCall);
 
   auto body = BraceStmt::create(
     ctx, SourceLoc(), { ret }, SourceLoc(), /*implicit=*/true);
@@ -140,14 +141,14 @@ static ValueDecl *deriveActor_unownedExecutor(DerivedConformance &derived) {
 
   auto propertyPair = derived.declareDerivedProperty(
       DerivedConformance::SynthesizedIntroducer::Var, ctx.Id_unownedExecutor,
-      executorType, executorType,
-      /*static*/ false, /*final*/ false);
+      executorType, /*static*/ false, /*final*/ false);
   auto property = propertyPair.first;
   property->setSynthesized(true);
   property->getAttrs().add(new (ctx) SemanticsAttr(SEMANTICS_DEFAULT_ACTOR,
                                                    SourceLoc(), SourceRange(),
                                                    /*implicit*/ true));
-  property->getAttrs().add(new (ctx) NonisolatedAttr(/*IsImplicit=*/true));
+  property->getAttrs().add(
+      new (ctx) NonisolatedAttr(/*unsafe=*/false, /*implicit=*/true));
 
   // Make the property implicitly final.
   property->getAttrs().add(new (ctx) FinalAttr(/*IsImplicit=*/true));
@@ -160,11 +161,9 @@ static ValueDecl *deriveActor_unownedExecutor(DerivedConformance &derived) {
   if (auto enclosingDecl = property->getInnermostDeclWithAvailability())
     asAvailableAs.push_back(enclosingDecl);
 
-  AvailabilityInference::applyInferredAvailableAttrs(
-      property, asAvailableAs, ctx);
+  AvailabilityInference::applyInferredAvailableAttrs(property, asAvailableAs);
 
-  auto getter =
-    derived.addGetterToReadOnlyDerivedProperty(property, executorType);
+  auto getter = derived.addGetterToReadOnlyDerivedProperty(property);
   getter->setBodySynthesizer(deriveBodyActor_unownedExecutor);
 
   derived.addMembersToConformanceContext(

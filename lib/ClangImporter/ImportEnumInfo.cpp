@@ -18,6 +18,7 @@
 #include "ClangAdapter.h"
 #include "ImportEnumInfo.h"
 #include "ImporterImpl.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/StringExtras.h"
 #include "swift/Parse/Lexer.h"
 #include "clang/AST/Attr.h"
@@ -108,11 +109,11 @@ void EnumInfo::classifyEnum(const clang::EnumDecl *decl,
 
   // If API notes have /removed/ a FlagEnum or EnumExtensibility attribute,
   // then we don't need to check the macros.
-  for (auto *attr : decl->specific_attrs<clang::SwiftVersionedAttr>()) {
+  for (auto *attr : decl->specific_attrs<clang::SwiftVersionedAdditionAttr>()) {
     if (!attr->getIsReplacedByActive())
       continue;
-    if (isa<clang::FlagEnumAttr>(attr->getAttrToAdd()) ||
-        isa<clang::EnumExtensibilityAttr>(attr->getAttrToAdd())) {
+    if (isa<clang::FlagEnumAttr>(attr->getAdditionalAttr()) ||
+        isa<clang::EnumExtensibilityAttr>(attr->getAdditionalAttr())) {
       kind = EnumKind::Unknown;
       return;
     }
@@ -219,7 +220,7 @@ StringRef importer::getCommonPluralPrefix(StringRef singular,
 
   // Is the plural string just "[singular]s"?
   plural = plural.drop_back();
-  if (plural.endswith(firstLeftoverWord))
+  if (plural.ends_with(firstLeftoverWord))
     return commonPrefixPlusWord;
 
   if (plural.empty() || plural.back() != 'e')
@@ -227,7 +228,7 @@ StringRef importer::getCommonPluralPrefix(StringRef singular,
 
   // Is the plural string "[singular]es"?
   plural = plural.drop_back();
-  if (plural.endswith(firstLeftoverWord))
+  if (plural.ends_with(firstLeftoverWord))
     return commonPrefixPlusWord;
 
   if (plural.empty() || !(plural.back() == 'i' && singular.back() == 'y'))
@@ -236,7 +237,7 @@ StringRef importer::getCommonPluralPrefix(StringRef singular,
   // Is the plural string "[prefix]ies" and the singular "[prefix]y"?
   plural = plural.drop_back();
   firstLeftoverWord = firstLeftoverWord.drop_back();
-  if (plural.endswith(firstLeftoverWord))
+  if (plural.ends_with(firstLeftoverWord))
     return commonPrefixPlusWord;
 
   return commonPrefix;

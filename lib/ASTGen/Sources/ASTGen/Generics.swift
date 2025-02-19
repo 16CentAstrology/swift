@@ -1,86 +1,160 @@
-import CASTBridging
-import SwiftParser
+//===--- Generics.swift ---------------------------------------------------===//
+//
+// This source file is part of the Swift.org open source project
+//
+// Copyright (c) 2022-2023 Apple Inc. and the Swift project authors
+// Licensed under Apache License v2.0 with Runtime Library Exception
+//
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+//
+//===----------------------------------------------------------------------===//
+
+import ASTBridging
+
+@_spi(ExperimentalLanguageFeatures)
+@_spi(RawSyntax)
 import SwiftSyntax
 
 extension ASTGenVisitor {
-  func visit(_ node: GenericParameterClauseSyntax) -> ASTNode {
-    let lAngleLoc = self.base.advanced(by: node.leftAngleBracket.position.utf8Offset).raw
-    let whereLoc = node.genericWhereClause.map {
-      self.base.advanced(by: $0.whereKeyword.position.utf8Offset).raw
-    }
-    let rAngleLoc = self.base.advanced(by: node.rightAngleBracket.position.utf8Offset).raw
-    return .misc(
-      self.withBridgedParametersAndRequirements(node) { params, reqs in
-        return GenericParamList_create(self.ctx, lAngleLoc, params, whereLoc, reqs, rAngleLoc)
-      })
+  func generate(genericParameterClause node: GenericParameterClauseSyntax) -> BridgedGenericParamList {
+    .createParsed(
+      self.ctx,
+      leftAngleLoc: self.generateSourceLoc(node.leftAngle),
+      parameters: node.parameters.lazy.map(self.generate).bridgedArray(in: self),
+      genericWhereClause: self.generate(genericWhereClause: node.genericWhereClause),
+      rightAngleLoc: self.generateSourceLoc(node.rightAngle)
+    )
   }
 
-  func visit(_ node: GenericParameterSyntax) -> ASTNode {
-    var nodeName = node.name.text
-    let name = nodeName.withUTF8 { buf in
-      return SwiftASTContext_getIdentifier(ctx, buf.baseAddress, buf.count)
-    }
-    let nameLoc = self.base.advanced(by: node.name.position.utf8Offset).raw
-    let ellipsisLoc = node.ellipsis.map { self.base.advanced(by: $0.position.utf8Offset).raw }
+  func generate(genericParameter node: GenericParameterSyntax) -> BridgedGenericTypeParamDecl {
+    let (name, nameLoc) = self.generateIdentifierAndSourceLoc(node.name)
 
-    return .decl(
-      GenericTypeParamDecl_create(
-        self.ctx, self.declContext, name, nameLoc, ellipsisLoc, node.indexInParent / 2,
-        ellipsisLoc != nil))
+    var genericParameterIndex: Int?
+    for (index, sibling) in (node.parent?.as(GenericParameterListSyntax.self) ?? []).enumerated() {
+      if sibling == node {
+        genericParameterIndex = index
+        break
+      }
+    }
+    guard let genericParameterIndex = genericParameterIndex else {
+      preconditionFailure("Node not part of the parent?")
+    }
+
+    var paramKind: BridgedGenericTypeParamKind = .type
+
+    if node.specifier?.tokenKind == .keyword(.each) {
+      paramKind = .pack
+    } else if node.specifier?.tokenKind == .keyword(.let) {
+      paramKind = .value
+    }
+
+    return .createParsed(
+      self.ctx,
+      declContext: self.declContext,
+      specifierLoc: self.generateSourceLoc(node.specifier),
+      name: name,
+      nameLoc: nameLoc,
+      inheritedType: self.generate(type: node.inheritedType),
+      index: genericParameterIndex,
+      paramKind: paramKind
+    )
   }
-}
 
-extension ASTGenVisitor {
-  private func withBridgedParametersAndRequirements<T>(
-    _ node: GenericParameterClauseSyntax,
-    action: (BridgedArrayRef, BridgedArrayRef) -> T
-  ) -> T {
-    var params = [UnsafeMutableRawPointer]()
-    var requirements = [BridgedRequirementRepr]()
-    for param in node.genericParameterList {
-      let loweredParameter = self.visit(param).rawValue
-      params.append(loweredParameter)
-
-      guard let requirement = param.inheritedType else {
-        continue
-      }
-
-      let loweredRequirement = self.visit(requirement)
-      GenericTypeParamDecl_setInheritedType(self.ctx, loweredParameter, loweredRequirement.rawValue)
-    }
-
-    if let nodeRequirements = node.genericWhereClause?.requirementList {
-      for requirement in nodeRequirements {
-        switch requirement.body {
-        case .conformanceRequirement(let conformance):
-          let firstType = self.visit(conformance.leftTypeIdentifier).rawValue
-          let separatorLoc = self.base.advanced(by: conformance.colon.position.utf8Offset).raw
-          let secondType = self.visit(conformance.rightTypeIdentifier).rawValue
-          requirements.append(
-            BridgedRequirementRepr(
-              SeparatorLoc: separatorLoc,
-              Kind: .typeConstraint,
-              FirstType: firstType,
-              SecondType: secondType))
-        case .sameTypeRequirement(let sameType):
-          let firstType = self.visit(sameType.leftTypeIdentifier).rawValue
-          let separatorLoc = self.base.advanced(by: sameType.equalityToken.position.utf8Offset).raw
-          let secondType = self.visit(sameType.rightTypeIdentifier).rawValue
-          requirements.append(
-            BridgedRequirementRepr(
-              SeparatorLoc: separatorLoc,
-              Kind: .sameType,
-              FirstType: firstType,
-              SecondType: secondType))
-        case .layoutRequirement(_):
-          fatalError("Cannot handle layout requirements!")
-        }
+  func generate(genericWhereClause node: GenericWhereClauseSyntax) -> BridgedTrailingWhereClause {
+    let requirements = node.requirements.lazy.map {
+      switch $0.requirement {
+      case .conformanceRequirement(let conformance):
+        return BridgedRequirementRepr(
+          SeparatorLoc: self.generateSourceLoc(conformance.colon),
+          Kind: .typeConstraint,
+          FirstType: self.generate(type: conformance.leftType),
+          SecondType: self.generate(type: conformance.rightType)
+        )
+      case .sameTypeRequirement(let sameType):
+        return BridgedRequirementRepr(
+          SeparatorLoc: self.generateSourceLoc(sameType.equal),
+          Kind: .sameType,
+          FirstType: self.generate(sameTypeLeftType: sameType.leftType),
+          SecondType: self.generate(sameTypeRightType: sameType.rightType)
+        )
+      case .layoutRequirement(_):
+        // FIXME: Implement layout requirement translation.
+        fatalError("Translation of layout requirements not implemented!")
       }
     }
-    return params.withBridgedArrayRef { params in
-      return requirements.withBridgedArrayRef { reqs in
-        return action(params, reqs)
-      }
+
+    return BridgedTrailingWhereClause.createParsed(
+      self.ctx,
+      whereKeywordLoc: self.generateSourceLoc(node.whereKeyword),
+      requirements: requirements.bridgedArray(in: self)
+    )
+  }
+
+  func generate(sameTypeLeftType node: SameTypeRequirementSyntax.LeftType) -> BridgedTypeRepr {
+    switch node {
+    case .type(let type):
+      return self.generate(type: type)
+
+    case .expr(let expr):
+      return self.generateIntegerType(expr: expr).asTypeRepr
     }
+  }
+
+  func generate(sameTypeRightType node: SameTypeRequirementSyntax.RightType) -> BridgedTypeRepr {
+    switch node {
+    case .type(let type):
+      return self.generate(type: type)
+
+    case .expr(let expr):
+      return self.generateIntegerType(expr: expr).asTypeRepr
+    }
+  }
+
+  func generate(genericArgument node: GenericArgumentSyntax.Argument) -> BridgedTypeRepr {
+    switch node {
+    case .type(let type):
+      return self.generate(type: type)
+
+    case .expr(let expr):
+      return self.generateIntegerType(expr: expr).asTypeRepr
+    }
+  }
+
+  func generateIntegerType(expr node: ExprSyntax) -> BridgedIntegerTypeRepr {
+    var minusLoc = BridgedSourceLoc()
+    let literalExpr: IntegerLiteralExprSyntax
+
+    // The only expressions generic argument types support right now are
+    // integer literals, '123', and prefix operators for negative integer
+    // literals, '-123'.
+    switch node.as(ExprSyntaxEnum.self) {
+    case .integerLiteralExpr(let node):
+      literalExpr = node
+
+    case .prefixOperatorExpr(let node):
+      let op = node.operator
+
+      guard op.text == "-" else {
+        fatalError("Unknown prefix operator for generic argument type")
+      }
+
+      guard let node = node.expression.as(IntegerLiteralExprSyntax.self) else {
+        fatalError("Unknown expression kind for generic argument type")
+      }
+
+      minusLoc = self.generateSourceLoc(op)
+      literalExpr = node
+
+    default:
+      fatalError("Unknown expression kind for generic argument type")
+    }
+
+    return .createParsed(
+      self.ctx,
+      string: self.copyAndStripUnderscores(text: literalExpr.literal.rawText),
+      loc: self.generateSourceLoc(literalExpr),
+      minusLoc: minusLoc
+    )
   }
 }

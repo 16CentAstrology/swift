@@ -174,6 +174,7 @@ public struct Range<Bound: Comparable> {
   ///
   /// - Parameter bounds: A tuple of the lower and upper bounds of the range.
   @inlinable
+  @unsafe
   public init(uncheckedBounds bounds: (lower: Bound, upper: Bound)) {
     _debugPrecondition(bounds.lower <= bounds.upper,
       "Range requires lowerBound <= upperBound")
@@ -375,6 +376,7 @@ extension Range {
   }
 }
 
+@_unavailableInEmbedded
 extension Range: CustomStringConvertible {
   /// A textual representation of the range.
   @inlinable // trivial-implementation
@@ -383,6 +385,7 @@ extension Range: CustomStringConvertible {
   }
 }
 
+@_unavailableInEmbedded
 extension Range: CustomDebugStringConvertible {
   /// A textual representation of the range, suitable for debugging.
   public var debugDescription: String {
@@ -438,6 +441,7 @@ extension Range: Hashable where Bound: Hashable {
   }
 }
 
+@_unavailableInEmbedded
 extension Range: Decodable where Bound: Decodable {
   public init(from decoder: Decoder) throws {
     var container = try decoder.unkeyedContainer()
@@ -453,6 +457,7 @@ extension Range: Decodable where Bound: Decodable {
   }
 }
 
+@_unavailableInEmbedded
 extension Range: Encodable where Bound: Encodable {
   public func encode(to encoder: Encoder) throws {
     var container = encoder.unkeyedContainer()
@@ -503,6 +508,7 @@ extension PartialRangeUpTo: RangeExpression {
   }
 }
 
+@_unavailableInEmbedded
 extension PartialRangeUpTo: Decodable where Bound: Decodable {
   public init(from decoder: Decoder) throws {
     var container = try decoder.unkeyedContainer()
@@ -510,6 +516,7 @@ extension PartialRangeUpTo: Decodable where Bound: Decodable {
   }
 }
 
+@_unavailableInEmbedded
 extension PartialRangeUpTo: Encodable where Bound: Encodable {
   public func encode(to encoder: Encoder) throws {
     var container = encoder.unkeyedContainer()
@@ -558,6 +565,7 @@ extension PartialRangeThrough: RangeExpression {
   }
 }
 
+@_unavailableInEmbedded
 extension PartialRangeThrough: Decodable where Bound: Decodable {
   public init(from decoder: Decoder) throws {
     var container = try decoder.unkeyedContainer()
@@ -565,6 +573,7 @@ extension PartialRangeThrough: Decodable where Bound: Decodable {
   }
 }
 
+@_unavailableInEmbedded
 extension PartialRangeThrough: Encodable where Bound: Encodable {
   public func encode(to encoder: Encoder) throws {
     var container = encoder.unkeyedContainer()
@@ -708,6 +717,7 @@ extension PartialRangeFrom: Sequence
   }
 }
 
+@_unavailableInEmbedded
 extension PartialRangeFrom: Decodable where Bound: Decodable {
   public init(from decoder: Decoder) throws {
     var container = try decoder.unkeyedContainer()
@@ -715,6 +725,7 @@ extension PartialRangeFrom: Decodable where Bound: Decodable {
   }
 }
 
+@_unavailableInEmbedded
 extension PartialRangeFrom: Encodable where Bound: Encodable {
   public func encode(to encoder: Encoder) throws {
     var container = encoder.unkeyedContainer()
@@ -975,7 +986,7 @@ extension Range {
   /// This example shows two overlapping ranges:
   ///
   ///     let x: Range = 0..<20
-  ///     print(x.overlaps(10...1000))
+  ///     print(x.overlaps(10..<1000))
   ///     // Prints "true"
   ///
   /// Because a half-open range does not include its upper bound, the ranges
@@ -1000,6 +1011,25 @@ extension Range {
     return !isDisjoint
   }
 
+  /// Returns a Boolean value indicating whether this range and the given closed
+  /// range contain an element in common.
+  ///
+  /// This example shows two overlapping ranges:
+  ///
+  ///     let x: Range = 0..<20
+  ///     print(x.overlaps(10...1000))
+  ///     // Prints "true"
+  ///
+  /// Because a half-open range does not include its upper bound, the ranges
+  /// in the following example do not overlap:
+  ///
+  ///     let y = 20...30
+  ///     print(x.overlaps(y))
+  ///     // Prints "false"
+  ///
+  /// - Parameter other: A closed range to check for elements in common.
+  /// - Returns: `true` if this range and `other` have at least one element in
+  ///   common; otherwise, `false`.
   @inlinable
   public func overlaps(_ other: ClosedRange<Bound>) -> Bool {
     // Disjoint iff the other range is completely before or after our range.
@@ -1010,6 +1040,64 @@ extension Range {
       || self.upperBound <= other.lowerBound
       || self.isEmpty
     return !isDisjoint
+  }
+}
+
+extension Range {
+  /// Returns a Boolean value indicating whether the given range is contained
+  /// within this range.
+  ///
+  /// The given range is contained within this range if its bounds are equal to
+  /// or within the bounds of this range.
+  ///
+  ///     let range = 0..<10
+  ///     range.contains(2..<5)        // true
+  ///     range.contains(2..<10)       // true
+  ///     range.contains(2..<12)       // false
+  ///
+  /// Additionally, passing any empty range as `other` results in the value
+  /// `true`, even if the empty range's bounds are outside the bounds of this
+  /// range.
+  ///
+  ///     let emptyRange = 3..<3
+  ///     emptyRange.contains(3..<3)   // true
+  ///     emptyRange.contains(5..<5)   // true
+  ///
+  /// - Parameter other: A range to check for containment within this range.
+  /// - Returns: `true` if `other` is empty or wholly contained within this
+  ///   range; otherwise, `false`.
+  ///
+  /// - Complexity: O(1)
+  @_alwaysEmitIntoClient
+  public func contains(_ other: Range<Bound>) -> Bool {
+    other.isEmpty ||
+      (lowerBound <= other.lowerBound && upperBound >= other.upperBound)
+  }
+  
+  /// Returns a Boolean value indicating whether the given closed range is
+  /// contained within this range.
+  ///
+  /// The given closed range is contained within this range if its bounds are
+  /// contained within this range. If this range is empty, it cannot contain a
+  /// closed range, since closed ranges by definition contain their boundaries.
+  ///
+  ///     let range = 0..<10
+  ///     range.contains(2...5)        // true
+  ///     range.contains(2...10)       // false
+  ///     range.contains(2...12)       // false
+  ///
+  ///     let emptyRange = 3..<3
+  ///     emptyRange.contains(3...3)   // false
+  ///
+  /// - Parameter other: A closed range to check for containment within this
+  ///   range.
+  /// - Returns: `true` if `other` is wholly contained within this range;
+  ///   otherwise, `false`.
+  ///
+  /// - Complexity: O(1)
+  @_alwaysEmitIntoClient
+  public func contains(_ other: ClosedRange<Bound>) -> Bool {
+    lowerBound <= other.lowerBound && upperBound > other.upperBound
   }
 }
 

@@ -93,9 +93,10 @@ public:
   }
   
   bool empty() const { return Pointer == nullptr; }
+  bool nonempty() const { return !empty(); }
 
   LLVM_ATTRIBUTE_USED bool is(StringRef string) const {
-    return str().equals(string);
+    return str() == string;
   }
   
   /// isOperator - Return true if this identifier is an operator, false if it is
@@ -117,6 +118,14 @@ public:
     return is("+") || is("-") || is("*") || is("/") || is("%");
   }
 
+  bool isBitwiseOperator() const {
+    return is("~") || is("&") || is("|") || is("^");
+  }
+
+  bool isShiftOperator() const {
+    return is("<<") || is(">>");
+  }
+
   // Returns whether this is a standard comparison operator,
   // such as '==', '>=' or '!=='.
   bool isStandardComparisonOperator() const {
@@ -126,10 +135,6 @@ public:
 
   bool isNilCoalescingOperator() const {
     return is("??");
-  }
-
-  bool isExpansionOperator() const {
-    return is("...");
   }
 
   /// isOperatorStartCodePoint - Return true if the specified code point is a
@@ -177,14 +182,18 @@ public:
   }
 
   bool hasDollarPrefix() const {
-    return str().startswith("$") && !(getLength() == 1);
+    return str().starts_with("$") && !(getLength() == 1);
+  }
+  
+  bool hasUnderscoredNaming() const {
+    return str().starts_with("_");
   }
   
   const void *getAsOpaquePointer() const {
       return static_cast<const void *>(Pointer);
   }
   
-  static Identifier getFromOpaquePointer(void *P) {
+  static Identifier getFromOpaquePointer(const void *P) {
     return Identifier((const char*)P);
   }
 
@@ -263,11 +272,15 @@ namespace llvm {
   
 } // end namespace llvm
 
+class BridgedDeclBaseName;
+
 namespace swift {
 
 /// Wrapper that may either be an Identifier or a special name
 /// (e.g. for subscripts)
 class DeclBaseName {
+  friend class ::BridgedDeclBaseName;
+
 public:
   enum class Kind: uint8_t {
     Normal,
@@ -321,6 +334,8 @@ public:
   bool isSpecial() const { return getKind() != Kind::Normal; }
 
   bool isSubscript() const { return getKind() == Kind::Subscript; }
+
+  bool isConstructor() const { return getKind() == Kind::Constructor; }
 
   /// Return the identifier backing the name. Assumes that the name is not
   /// special.
@@ -843,7 +858,7 @@ public:
   /// This should not be used to parse selectors written directly in Swift
   /// source code (e.g. the argument of an @objc attribute). Use the
   /// parser for that.
-  static llvm::Optional<ObjCSelector> parse(ASTContext &ctx, StringRef string);
+  static std::optional<ObjCSelector> parse(ASTContext &ctx, StringRef string);
 
   /// Convert to true if the decl name is valid.
   explicit operator bool() const { return (bool)Storage; }

@@ -33,7 +33,7 @@ class Triple;
 }
 
 namespace swift {
-class AvailabilityContext;
+class AvailabilityRange;
 
 namespace irgen {
 class IRGenModule;
@@ -45,6 +45,7 @@ bool useDllStorage(const llvm::Triple &triple);
 class UniversalLinkageInfo {
 public:
   bool IsELFObject;
+  bool IsMSVCEnvironment;
   bool UseDLLStorage;
   bool Internalize;
 
@@ -55,10 +56,15 @@ public:
   /// be promoted to public external. Used by the LLDB expression evaluator.
   bool ForcePublicDecls;
 
+  /// When true, allows duplicate external and hidden declarations by marking
+  /// them as linkonce / weak.
+  bool MergeableSymbols;
+
   explicit UniversalLinkageInfo(IRGenModule &IGM);
 
   UniversalLinkageInfo(const llvm::Triple &triple, bool hasMultipleIGMs,
-                       bool forcePublicDecls, bool isStaticLibrary);
+                       bool forcePublicDecls, bool isStaticLibrary,
+                       bool mergeableSymbols);
 
   /// In case of multiple llvm modules (in multi-threaded compilation) all
   /// private decls must be visible from other files.
@@ -84,6 +90,37 @@ enum class TypeMetadataAddress {
   FullMetadata,
 };
 
+inline bool isEmbedded(CanType t) {
+  return t->getASTContext().LangOpts.hasFeature(Feature::Embedded);
+}
+
+// Metadata is not generated and not allowed to be referenced in Embedded Swift,
+// expect for classes (both generic and non-generic), dynamic self, and
+// class-bound existentials.
+inline bool isMetadataAllowedInEmbedded(CanType t) {
+  if (isa<ClassType>(t) || isa<BoundGenericClassType>(t) ||
+      isa<DynamicSelfType>(t)) {
+    return true;
+  }
+  if (auto existentialTy = dyn_cast<ExistentialType>(t)) {
+    if (existentialTy->requiresClass())
+      return true;
+  }
+  if (auto archeTy = dyn_cast<ArchetypeType>(t)) {
+    if (archeTy->requiresClass())
+      return true;
+  }
+  return false;
+}
+
+inline bool isEmbedded(Decl *d) {
+  return d->getASTContext().LangOpts.hasFeature(Feature::Embedded);
+}
+
+inline bool isEmbedded(const ProtocolConformance *c) {
+  return c->getType()->getASTContext().LangOpts.hasFeature(Feature::Embedded);
+}
+
 /// A link entity is some sort of named declaration, combined with all
 /// the information necessary to distinguish specific implementations
 /// of the declaration from each other.
@@ -108,6 +145,9 @@ class LinkEntity {
 
     // This field appears in the TypeMetadata and ObjCResilientClassStub kinds.
     MetadataAddressShift = 8, MetadataAddressMask = 0x0300,
+
+    // This field appears in the TypeMetadata kind.
+    ForceSharedShift = 12, ForceSharedMask = 0x1000,
 
     // This field appears in associated type access functions.
     AssociatedTypeIndexShift = 8, AssociatedTypeIndexMask = ~KindMask,
@@ -324,14 +364,14 @@ class LinkEntity {
     BaseConformanceDescriptor,
 
     /// A global function pointer for dynamically replaceable functions.
-    /// The pointer is a AbstractStorageDecl*.
+    /// The pointer is a AbstractFunctionDecl*.
     DynamicallyReplaceableFunctionVariableAST,
 
-    /// The pointer is a AbstractStorageDecl*.
+    /// The pointer is a AbstractFunctionDecl*.
     DynamicallyReplaceableFunctionKeyAST,
 
     /// The original implementation of a dynamically replaceable function.
-    /// The pointer is a AbstractStorageDecl*.
+    /// The pointer is a AbstractFunctionDecl*.
     DynamicallyReplaceableFunctionImpl,
 
     /// The once token used by cacheCanonicalSpecializedMetadata, by way of
@@ -341,10 +381,8 @@ class LinkEntity {
     /// the metadata cache once.
     CanonicalPrespecializedGenericTypeCachingOnceToken,
 
-    /// The record that describes an attribute that could be looked
-    /// up at runtime together with all types it's attached to and
-    /// generator functions.
-    RuntimeDiscoverableAttributeRecord,
+    /// The function used to access distributed methods and accessors.
+    DistributedAccessor,
 
     /// The same as AsyncFunctionPointer but with a different stored value, for
     /// use by TBDGen.
@@ -369,7 +407,8 @@ class LinkEntity {
     /// A SIL global variable. The pointer is a SILGlobalVariable*.
     SILGlobalVariable,
 
-    /// An outlined read-only global object. The pointer is a SILGlobalVariable*.
+    /// An outlined read-only global object. The pointer is a
+    /// SILGlobalVariable*.
     ReadOnlyGlobalObject,
 
     // These next few are protocol-conformance kinds.
@@ -498,14 +537,14 @@ class LinkEntity {
     /// The pointer is a const char* of the name.
     KnownAsyncFunctionPointer,
 
-    /// The pointer is SILFunction*
-    DistributedAccessor,
-    /// An async function pointer for a distributed accessor (method or property).
+    /// An async function pointer for a distributed accessor (method or
+    /// property).
     /// The pointer is a SILFunction*.
     DistributedAccessorAsyncPointer,
 
     /// Accessible function record, which describes a function that can be
     /// looked up by name by the runtime.
+    /// The pointer is a SILFunction*.
     AccessibleFunctionRecord,
 
     /// Extended existential type shape.
@@ -517,6 +556,20 @@ class LinkEntity {
 
   Kind getKind() const {
     return Kind(LINKENTITY_GET_FIELD(Data, Kind));
+  }
+
+  friend llvm::hash_code hash_value(const LinkEntity &Entity) {
+    return llvm::hash_combine(Entity.Pointer, Entity.SecondaryPointer,
+                              Entity.Data);
+  }
+
+  friend bool operator==(const LinkEntity &LHS, const LinkEntity &RHS) {
+    return LHS.Pointer == RHS.Pointer &&
+           LHS.SecondaryPointer == RHS.SecondaryPointer && LHS.Data == RHS.Data;
+  }
+
+  friend bool operator!=(const LinkEntity &LHS, const LinkEntity &RHS) {
+    return !(LHS == RHS);
   }
 
   static bool isDeclKind(Kind k) {
@@ -679,7 +732,7 @@ class LinkEntity {
     Data = LINKENTITY_SET_FIELD(Kind, unsigned(kind));
   }
 
-  LinkEntity() = default;
+  LinkEntity() : Pointer(nullptr), SecondaryPointer(nullptr), Data(0) {}
 
   static bool isValidResilientMethodRef(SILDeclRef declRef) {
     if (declRef.isForeign)
@@ -816,15 +869,19 @@ public:
   }
 
   static LinkEntity forTypeMetadata(CanType concreteType,
-                                    TypeMetadataAddress addr) {
+                                    TypeMetadataAddress addr,
+                                    bool forceShared = false) {
     assert(!isObjCImplementation(concreteType));
+    assert(!isEmbedded(concreteType) || isMetadataAllowedInEmbedded(concreteType));
     LinkEntity entity;
     entity.setForType(Kind::TypeMetadata, concreteType);
     entity.Data |= LINKENTITY_SET_FIELD(MetadataAddress, unsigned(addr));
+    entity.Data |= LINKENTITY_SET_FIELD(ForceShared, unsigned(forceShared));
     return entity;
   }
 
   static LinkEntity forTypeMetadataPattern(NominalTypeDecl *decl) {
+    assert(!isEmbedded(decl));
     LinkEntity entity;
     entity.setForDecl(Kind::TypeMetadataPattern, decl);
     return entity;
@@ -881,6 +938,7 @@ public:
 
   static LinkEntity forNominalTypeDescriptor(NominalTypeDecl *decl) {
     assert(!isObjCImplementation(decl));
+    assert(!isEmbedded(decl));
     LinkEntity entity;
     entity.setForDecl(Kind::NominalTypeDescriptor, decl);
     return entity;
@@ -888,18 +946,21 @@ public:
 
   static LinkEntity forNominalTypeDescriptorRecord(NominalTypeDecl *decl) {
     assert(!isObjCImplementation(decl));
+    assert(!isEmbedded(decl));
     LinkEntity entity;
     entity.setForDecl(Kind::NominalTypeDescriptorRecord, decl);
     return entity;
   }
 
   static LinkEntity forOpaqueTypeDescriptor(OpaqueTypeDecl *decl) {
+    assert(!isEmbedded(decl));
     LinkEntity entity;
     entity.setForDecl(Kind::OpaqueTypeDescriptor, decl);
     return entity;
   }
 
   static LinkEntity forOpaqueTypeDescriptorRecord(OpaqueTypeDecl *decl) {
+    assert(!isEmbedded(decl));
     LinkEntity entity;
     entity.setForDecl(Kind::OpaqueTypeDescriptorRecord, decl);
     return entity;
@@ -980,6 +1041,8 @@ public:
   }
 
   static LinkEntity forValueWitness(CanType concreteType, ValueWitness witness) {
+    // Explicitly allowed in embedded Swift because we generate value witnesses
+    // (but not witness tables) for Swift Concurrency usage.
     LinkEntity entity;
     entity.Pointer = concreteType.getPointer();
     entity.Data = LINKENTITY_SET_FIELD(Kind, unsigned(Kind::ValueWitness))
@@ -988,6 +1051,7 @@ public:
   }
 
   static LinkEntity forValueWitnessTable(CanType type) {
+    assert(!isEmbedded(type));
     LinkEntity entity;
     entity.setForType(Kind::ValueWitnessTable, type);
     return entity;
@@ -1016,7 +1080,11 @@ public:
     return entity;
   }
 
-  static LinkEntity forProtocolWitnessTable(const RootProtocolConformance *C) {
+  static LinkEntity forProtocolWitnessTable(const ProtocolConformance *C) {
+    if (isEmbedded(C)) {
+      assert(C->getProtocol()->requiresClass());
+    }
+
     LinkEntity entity;
     entity.setForProtocolConformance(Kind::ProtocolWitnessTable, C);
     return entity;
@@ -1024,6 +1092,7 @@ public:
 
   static LinkEntity
   forProtocolWitnessTablePattern(const ProtocolConformance *C) {
+    assert(!isEmbedded(C));
     LinkEntity entity;
     entity.setForProtocolConformance(Kind::ProtocolWitnessTablePattern, C);
     return entity;
@@ -1268,8 +1337,7 @@ public:
 
     case LinkEntity::Kind::DistributedAccessor: {
       entity.Data = LINKENTITY_SET_FIELD(
-          Kind,
-          unsigned(LinkEntity::Kind::DistributedAccessorAsyncPointer));
+          Kind, unsigned(LinkEntity::Kind::DistributedAccessorAsyncPointer));
       break;
     }
 
@@ -1301,6 +1369,10 @@ public:
   }
 
   static LinkEntity forDistributedTargetAccessor(SILFunction *target) {
+    return forDistributedTargetAccessor(target->getDeclContext()->getAsDecl());
+  }
+
+  static LinkEntity forDistributedTargetAccessor(Decl *target) {
     LinkEntity entity;
     entity.Pointer = target;
     entity.SecondaryPointer = nullptr;
@@ -1385,15 +1457,9 @@ public:
     return entity;
   }
 
-  static LinkEntity forRuntimeDiscoverableAttributeRecord(NominalTypeDecl *attr) {
-    LinkEntity entity;
-    entity.setForDecl(Kind::RuntimeDiscoverableAttributeRecord, attr);
-    return entity;
-  }
-
-  void mangle(llvm::raw_ostream &out) const;
-  void mangle(SmallVectorImpl<char> &buffer) const;
-  std::string mangleAsString() const;
+  void mangle(ASTContext &Ctx, llvm::raw_ostream &out) const;
+  void mangle(ASTContext &Ctx, SmallVectorImpl<char> &buffer) const;
+  std::string mangleAsString(ASTContext &Ctx) const;
 
   SILDeclRef getSILDeclRef() const;
   SILLinkage getLinkage(ForDefinition_t isDefinition) const;
@@ -1410,6 +1476,11 @@ public:
   const ExtensionDecl *getExtension() const {
     assert(getKind() == Kind::ExtensionDescriptor);
     return reinterpret_cast<ExtensionDecl*>(Pointer);
+  }
+
+  const AbstractStorageDecl *getAbstractStorageDecl() const {
+    assert(getKind() == Kind::PropertyDescriptor);
+    return reinterpret_cast<AbstractStorageDecl *>(Pointer);
   }
 
   const PointerUnion<DeclContext *, VarDecl *> getAnonymousDeclContext() const {
@@ -1444,8 +1515,8 @@ public:
   }
 
   const RootProtocolConformance *getRootProtocolConformance() const {
-    assert(isRootProtocolConformanceKind(getKind()));
-    return cast<RootProtocolConformance>(getProtocolConformance());
+    assert(isProtocolConformanceKind(getKind()));
+    return getProtocolConformance()->getRootConformance();
   }
   
   const ProtocolConformance *getProtocolConformance() const {
@@ -1545,6 +1616,10 @@ public:
            getKind() == Kind::ObjCResilientClassStub);
     return (TypeMetadataAddress)LINKENTITY_GET_FIELD(Data, MetadataAddress);
   }
+  bool isForcedShared() const {
+    assert(getKind() == Kind::TypeMetadata);
+    return (bool)LINKENTITY_GET_FIELD(Data, ForceShared);
+  }
   bool isObjCClassRef() const {
     return getKind() == Kind::ObjCClassRef;
   }
@@ -1560,11 +1635,18 @@ public:
   bool isTypeMetadataAccessFunction() const {
     return getKind() == Kind::TypeMetadataAccessFunction;
   }
+  bool isDistributedThunk() const;
   bool isDispatchThunk() const {
     return getKind() == Kind::DispatchThunk ||
            getKind() == Kind::DispatchThunkInitializer ||
            getKind() == Kind::DispatchThunkAllocator ||
            getKind() == Kind::DispatchThunkDerivative;
+  }
+  bool isPropertyDescriptor() const {
+    return getKind() == Kind::PropertyDescriptor;
+  }
+  bool isNominalTypeDescriptor() const {
+    return getKind() == Kind::NominalTypeDescriptor;
   }
 
   /// Determine whether this entity will be weak-imported.
@@ -1580,6 +1662,14 @@ public:
   /// Get the default LLVM type to use for forward declarations of this
   /// entity.
   llvm::Type *getDefaultDeclarationType(IRGenModule &IGM) const;
+
+  /// Determine whether entity that represents a symbol is in TEXT segment.
+  bool isText() const;
+
+  /// Determine whether entity that represents a symbol is in DATA segment.
+  bool isData() const { return !isText(); }
+
+  bool isTypeKind() const { return isTypeKind(getKind()); }
 
   bool isAlwaysSharedLinkage() const;
 #undef LINKENTITY_GET_FIELD

@@ -29,6 +29,7 @@ class AssociatedTypeDecl;
 class ASTContext;
 struct ASTNode;
 class CallExpr;
+class CaseStmt;
 class Decl;
 class DeclContext;
 class DeclRefExpr;
@@ -54,11 +55,12 @@ public:
 
 public:
   ASTContext &Context;
+  const NormalProtocolConformance *Conformance;
   Decl *ConformanceDecl;
   NominalTypeDecl *Nominal;
   ProtocolDecl *Protocol;
 
-  DerivedConformance(ASTContext &ctx, Decl *conformanceDecl,
+  DerivedConformance(const NormalProtocolConformance *conformance,
                      NominalTypeDecl *nominal, ProtocolDecl *protocol);
 
   /// Retrieve the context in which the conformance is declared (either the
@@ -366,18 +368,14 @@ public:
   /// Declare a read-only property.
   std::pair<VarDecl *, PatternBindingDecl *>
   declareDerivedProperty(SynthesizedIntroducer intro, Identifier name,
-                         Type propertyInterfaceType, Type propertyContextType,
-                         bool isStatic, bool isFinal);
+                         Type propertyContextType, bool isStatic, bool isFinal);
 
   /// Add a getter to a derived property.  The property becomes read-only.
-  static AccessorDecl *
-  addGetterToReadOnlyDerivedProperty(VarDecl *property,
-                                     Type propertyContextType);
+  static AccessorDecl *addGetterToReadOnlyDerivedProperty(VarDecl *property);
 
   /// Declare a getter for a derived property.
   /// The getter will not be added to the property yet.
-  static AccessorDecl *declareDerivedPropertyGetter(VarDecl *property,
-                                                    Type propertyContextType);
+  static AccessorDecl *declareDerivedPropertyGetter(VarDecl *property);
 
   /// Build a reference to the 'self' decl of a derived function.
   static DeclRefExpr *createSelfDeclRef(AbstractFunctionDecl *fn);
@@ -386,8 +384,12 @@ public:
   static CallExpr *createBuiltinCall(ASTContext &ctx,
                                      BuiltinValueKind builtin,
                                      ArrayRef<Type> typeArgs,
-                              ArrayRef<ProtocolConformanceRef> conformances,
                                      ArrayRef<Expr *> args);
+
+  /// Build a call to the stdlib function that should be called when unavailable
+  /// code is reached unexpectedly.
+  static CallExpr *
+  createDiagnoseUnavailableCodeReachedCallExpr(ASTContext &ctx);
 
   /// Returns true if this derivation is trying to use a context that isn't
   /// appropriate for deriving.
@@ -409,6 +411,12 @@ public:
   // return false
   static GuardStmt *returnFalseIfNotEqualGuard(ASTContext &C, Expr *lhsExpr,
                                                Expr *rhsExpr);
+
+  // Return `nil` is the `testExp` is `false`.
+  static GuardStmt *returnNilIfFalseGuardTypeChecked(ASTContext &C,
+                                                     Expr *testExpr,
+                                                     Type optionalWrappedType);
+
   // return lhs < rhs
   static GuardStmt *
   returnComparisonIfNotEqualGuard(ASTContext &C, Expr *lhsExpr, Expr *rhsExpr);
@@ -446,6 +454,16 @@ public:
   static Pattern *enumElementPayloadSubpattern(
       EnumElementDecl *enumElementDecl, char varPrefix, DeclContext *varContext,
       SmallVectorImpl<VarDecl *> &boundVars, bool useLabels = false);
+
+  /// Creates a synthesized case statement that has the following structure:
+  ///
+  ///     case .<elt>, ..., .<elt>:
+  ///       _diagnoseUnavailableCodeReached()
+  ///
+  /// The number of \c .<elt> matches is equal to \p subPatternCount.
+  static CaseStmt *unavailableEnumElementCaseStmt(
+      Type enumType, EnumElementDecl *enumElementDecl, DeclContext *parentDC,
+      unsigned subPatternCount = 1);
 
   static VarDecl *indexedVarDecl(char prefixChar, int index, Type type,
                                  DeclContext *varContext);

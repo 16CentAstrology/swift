@@ -96,9 +96,12 @@ do {
   }  
   inSubcall = false
 
-  // This is a problem, but isn't clear what was intended.
-  var somethingElse = true { // expected-error {{unexpected '{' in declaration}}
-  }  
+  // These are a problems, but it's not clear what was intended.
+  var somethingElse = true {
+  // expected-error@-1 {{computed property must have an explicit type}}
+  // expected-error@-2 {{variable with getter/setter cannot have an initial value}}
+  }
+  var somethingElseWithTypeAnno: Bool = true {} // expected-error {{variable with getter/setter cannot have an initial value}}
   inSubcall = false
 
   var v2 : Bool = false
@@ -353,7 +356,7 @@ var afterMessageCount : Int?
 func uintFunc() -> UInt {}
 func takeVoidVoidFn(_ a : () -> ()) {}
 takeVoidVoidFn { () -> Void in
-  afterMessageCount = uintFunc()  // expected-error {{cannot assign value of type 'UInt' to type 'Int?'}} {{23-23=Int(}} {{33-33=)}}
+  afterMessageCount = uintFunc()  // expected-error {{cannot assign value of type 'UInt' to type 'Int'}} {{23-23=Int(}} {{33-33=)}}
 }
 
 // <rdar://problem/19997471> Swift: Incorrect compile error when calling a function inside a closure
@@ -379,14 +382,14 @@ let _ = [0].map {
 func rdar21078316() {
   var foo : [String : String]?
   var bar : [(String, String)]?
-  bar = foo.map { ($0, $1) }  // expected-error {{contextual closure type '([String : String]) throws -> [(String, String)]' expects 1 argument, but 2 were used in closure body}}
+  bar = foo.map { ($0, $1) }  // expected-error {{contextual closure type '([String : String]) -> [(String, String)]' expects 1 argument, but 2 were used in closure body}}
   // expected-error@-1{{cannot convert value of type '(Dictionary<String, String>, _)' to closure result type '[(String, String)]'}}
 }
 
 
 // <rdar://problem/20978044> QoI: Poor diagnostic when using an incorrect tuple element in a closure
 var numbers = [1, 2, 3]
-zip(numbers, numbers).filter { $0.2 > 1 }  // expected-error {{value of tuple type '(Int, Int)' has no member '2'}}
+zip(numbers, numbers).filter { $0.2 > 1 }  // expected-error {{value of tuple type 'Zip2Sequence<[Int], [Int]>.Element' (aka '(Int, Int)') has no member '2'}}
 
 
 
@@ -516,7 +519,7 @@ do {
   func set_via_closure<T, U>(_ closure: (inout T, U) -> ()) {} // expected-note {{in call to function 'set_via_closure'}}
   set_via_closure({ $0.number1 = $1 })
   // expected-error@-1 {{generic parameter 'T' could not be inferred}}
-  // expected-error@-2 {{unable to infer type of a closure parameter '$1' in the current context}}
+  // expected-error@-2 {{cannot infer type of closure parameter '$1' without a type annotation}}
 
   func f2<T>(_ item: T, _ update: (inout T) -> Void) {
     var x = item
@@ -624,7 +627,10 @@ extension P_47606 {
 let u = rdar33296619().element //expected-error {{cannot find 'rdar33296619' in scope}}
 
 [1].forEach { _ in
-  _ = "\(u)"
+  _ = "\(u)" // No diagnostic because `u` is already diagnosed and marked as invalid
+}
+
+[1].forEach { _ in
   _ = 1 + "hi" // expected-error {{binary operator '+' cannot be applied to operands of type 'Int' and 'String'}}
   // expected-note@-1 {{overloads for '+' exist with these partially matching parameter lists: (Int, Int), (String, String)}}
 }
@@ -1023,7 +1029,7 @@ func rdar_59741308() {
 func r60074136() {
   func takesClosure(_ closure: ((Int) -> Void) -> Void) {}
 
-  takesClosure { ((Int) -> Void) -> Void in // expected-warning {{unnamed parameters must be written with the empty name '_'}}
+  takesClosure { ((Int) -> Void) -> Void in // expected-warning {{unnamed parameters must be written with the empty name '_'; this is an error in the Swift 6 language mode}}
   }
 }
 
@@ -1052,12 +1058,12 @@ overloaded_with_default_and_autoclosure { 42 } // Ok
 overloaded_with_default_and_autoclosure(42) // Ok
 
 /// https://github.com/apple/swift/issues/55261
-/// "error: type of expression is ambiguous without more context" in many cases
+/// "error: type of expression is ambiguous without a type annotation" in many cases
 /// where methods are missing.
 do {
   let _ = { a, b in }
-  // expected-error@-1 {{unable to infer type of a closure parameter 'a' in the current context}}
-  // expected-error@-2 {{unable to infer type of a closure parameter 'b' in the current context}}
+  // expected-error@-1 {{cannot infer type of closure parameter 'a' without a type annotation}}
+  // expected-error@-2 {{cannot infer type of closure parameter 'b' without a type annotation}}
 
   _ = .a { b in } // expected-error {{cannot infer contextual base in reference to member 'a'}}
 
@@ -1078,7 +1084,7 @@ let explicitUnboundResult2: (Array<Bool>) -> Array<Int> = {
 }
 // FIXME: Should we prioritize the contextual result type and infer Array<Int>
 // rather than using a type variable in these cases?
-// expected-error@+1 {{unable to infer closure type in the current context}}
+// expected-error@+1 {{unable to infer closure type without a type annotation}}
 let explicitUnboundResult3: (Array<Bool>) -> Array<Int> = {
   (arr: Array) -> Array in [true]
 }
@@ -1140,18 +1146,20 @@ struct R_76250381<Result, Failure: Error> {
 
 // https://github.com/apple/swift/issues/55926
 (0..<10).map { x, y in } 
-// expected-error@-1 {{contextual closure type '(Range<Int>.Element) throws -> ()' (aka '(Int) throws -> ()') expects 1 argument, but 2 were used in closure body}}
+// expected-error@-1 {{contextual closure type '(Range<Int>.Element) -> ()' (aka '(Int) -> ()') expects 1 argument, but 2 were used in closure body}}
 (0..<10).map { x, y, z in } 
-// expected-error@-1 {{contextual closure type '(Range<Int>.Element) throws -> ()' (aka '(Int) throws -> ()') expects 1 argument, but 3 were used in closure body}}
+// expected-error@-1 {{contextual closure type '(Range<Int>.Element) -> ()' (aka '(Int) -> ()') expects 1 argument, but 3 were used in closure body}}
 (0..<10).map { x, y, z, w in } 
-// expected-error@-1 {{contextual closure type '(Range<Int>.Element) throws -> ()' (aka '(Int) throws -> ()') expects 1 argument, but 4 were used in closure body}}
+// expected-error@-1 {{contextual closure type '(Range<Int>.Element) -> ()' (aka '(Int) -> ()') expects 1 argument, but 4 were used in closure body}}
 
 // rdar://77022842 - crash due to a missing argument to a ternary operator
 func rdar77022842(argA: Bool? = nil, argB: Bool? = nil) {
   if let a = argA ?? false, if let b = argB ?? {
     // expected-error@-1 {{initializer for conditional binding must have Optional type, not 'Bool'}}
-    // expected-error@-2 {{cannot convert value of type '() -> ()' to expected argument type 'Bool?'}}
-    // expected-error@-3 {{expected expression in conditional}}
+    // expected-error@-2 {{closure passed to parameter of type 'Bool?' that does not accept a closure}}
+    // expected-error@-3 {{cannot convert value of type 'Void' to expected condition type 'Bool'}}
+    // expected-error@-4 {{'if' may only be used as expression in return, throw, or as the source of an assignment}}
+    // expected-error@-5 {{'if' must have an unconditional 'else' to be used as expression}}
   } // expected-error {{expected '{' after 'if' condition}}
 }
 
@@ -1168,6 +1176,7 @@ func rdar76058892() {
     test { // expected-error {{contextual closure type '() -> String' expects 0 arguments, but 1 was used in closure body}}
       if let arr = arr {
         arr.map($0.test) // expected-note {{anonymous closure parameter '$0' is used here}} // expected-error {{generic parameter 'T' could not be inferred}}
+        // expected-error@-1 {{generic parameter 'E' could not be inferred}}
       }
     }
   }
@@ -1221,6 +1230,110 @@ func closureWithCaseArchetype<T>(_: T.Type) {
 
     default:
       return any
+    }
+  }
+}
+
+// rdar://112426330 - invalid diagnostic when closure argument is omitted
+do {
+  func test<T>(_: T, _: (T) -> Void) {}
+
+  test(42) { // expected-error {{contextual type for closure argument list expects 1 argument, which cannot be implicitly ignored}} {{13-13= _ in}}
+    print("")
+  }
+
+  func context(_: (Int) -> Void) {}
+  func context(_: () -> Void) {}
+
+  context {
+    test(42) { // expected-error {{contextual type for closure argument list expects 1 argument, which cannot be implicitly ignored}} {{15-15= _ in}}
+      print("")
+    }
+  }
+
+
+}
+
+do {
+  func test(_: Int, _: Int) {}
+  // expected-note@-1 {{closure passed to parameter of type 'Int' that does not accept a closure}}
+  func test(_: Int, _: String) {}
+  // expected-note@-1 {{closure passed to parameter of type 'String' that does not accept a closure}}
+
+  test(42) { // expected-error {{no exact matches in call to local function 'test'}}
+    print($0)
+  }
+}
+
+// Currently legal.
+let _: () -> Int = { return fatalError() }
+
+// Make sure that `Void` assigned to closure result doesn't get eagerly propagated into the body
+do {
+  class C {
+    func f(_: Any) -> Int! { fatalError() }
+    static func f(_: Any) -> Int! { fatalError() }
+  }
+
+  class G<T> {
+    func g<U>(_ u: U, _: (U, T) -> ()) {}
+
+    func g<U: C>(_ u: U) {
+        g(u) { $0.f($1) } // expected-warning {{result of call to 'f' is unused}}
+    }
+  }
+}
+
+// Make sure that closure gets both Void? and Void attempted
+// otherwise it won't be possible to type-check the second closure.
+do {
+  struct Semaphore {
+    func signal() -> Int {}
+  }
+
+  func compute(_ completion: (Semaphore?) -> Void?) {}
+
+  func test() {
+    compute { $0?.signal() }
+    // expected-warning@-1 {{result of call to 'signal()' is unused}}
+
+    true
+      ? compute({ $0?.signal() }) // expected-warning {{result of call to 'signal()' is unused}}
+      : compute({
+           let sem = $0!
+           sem.signal() // expected-warning {{result of call to 'signal()' is unused}}
+        })
+  }
+}
+
+// rdar://143474313 - invalid error: member 'init(item:)' in 'Test.Item?' produces result of type 'Test.Item', but context expects 'Test.Item?'
+do {
+  struct List {
+    struct Item {
+    }
+
+    var items: [Item] = []
+  }
+
+  struct Test {
+    struct Item {
+      init(item: List.Item) {
+      }
+    }
+
+    let list: List
+
+    var items: [Test.Item] { .init(list.items.compactMap { .init(item: $0) }) } // Ok
+  }
+}
+
+// This should type check
+func rdar143338891() {
+  func takesAny(_: Any?) {}
+
+  class Test {
+    func test() {
+      _ = { [weak self] in takesAny(self) }
     }
   }
 }

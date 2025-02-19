@@ -10,11 +10,11 @@
 //
 //===----------------------------------------------------------------------===//
 
-#if (os(macOS) || os(iOS) || os(tvOS) || os(watchOS)) && _runtime(_ObjC)
+#if (os(macOS) || os(iOS) || os(tvOS) || os(watchOS) || os(visionOS)) && _runtime(_ObjC)
 
 /// Enumeration describing POSIX error codes.
 @objc
-public enum POSIXErrorCode : Int32 {
+public enum POSIXErrorCode: Int32, Sendable {
   /// Operation not permitted.
   case EPERM           = 1
   /// No such file or directory.
@@ -266,7 +266,7 @@ public enum POSIXErrorCode : Int32 {
 #elseif os(Linux) || os(Android)
 
 /// Enumeration describing POSIX error codes.
-public enum POSIXErrorCode : Int32 {
+public enum POSIXErrorCode: Int32, Sendable {
   /// Operation not permitted.
   case EPERM           = 1
   /// No such file or directory.
@@ -561,7 +561,7 @@ public enum POSIXErrorCode : Int32 {
 // Matches WASI-libc declarations at https://github.com/WebAssembly/wasi-libc/blob/ad513341/libc-bottom-half/headers/public/wasi/api.h#L106
 
 /// Enumeration describing POSIX error codes.
-public enum POSIXErrorCode : Int32 {
+public enum POSIXErrorCode: Int32, Sendable {
   /// Argument list too long.
   case E2BIG           = 1
   /// Permission denied.
@@ -727,7 +727,7 @@ public enum POSIXErrorCode : Int32 {
 #elseif os(Windows)
 
 /// Enumeration describing POSIX error codes.
-public enum POSIXErrorCode : Int32 {
+public enum POSIXErrorCode: Int32, Sendable {
     
     /// Operation not permitted
     case EPERM          = 1
@@ -850,10 +850,10 @@ public enum POSIXErrorCode : Int32 {
     case STRUNCATE      = 80
 }
 
-#elseif os(OpenBSD)
+#elseif os(OpenBSD) || os(FreeBSD)
 
 /// Enumeration describing POSIX error codes.
-public enum POSIXErrorCode : Int32 {
+public enum POSIXErrorCode: Int32, Sendable {
     /// Operation not permitted
     case EPERM			= 1
     /// No such file or directory
@@ -1018,6 +1018,8 @@ public enum POSIXErrorCode : Int32 {
     case EAUTH			= 80
     /// Need authenticator
     case ENEEDAUTH		= 81
+
+#if os(OpenBSD)
     /// IPsec processing failure
     case EIPSEC			= 82
     /// Attribute not found
@@ -1046,6 +1048,40 @@ public enum POSIXErrorCode : Int32 {
     case EOWNERDEAD		= 94
     /// Protocol error
     case EPROTO			= 95
+#elseif os(FreeBSD)
+    /// Identifier removed
+    case EIDRM                  = 82
+    /// No message of desired type
+    case ENOMSG                 = 83
+    /// Value too large to be stored in data type
+    case EOVERFLOW              = 84
+    /// Operation canceled
+    case ECANCELED              = 85
+    /// Illegal byte sequence
+    case EILSEQ                 = 86
+    /// Attribute not found
+    case ENOATTR                = 87
+    /// Programming error
+    case EDOOFUS                = 88
+    /// Bad message
+    case EBADMSG                = 89
+    /// Multihop attempted
+    case EMULTIHOP              = 90
+    /// Link has been severed
+    case ENOLINK                = 91
+    /// Protocol error
+    case EPROTO                 = 92
+    /// Capabilities insufficient
+    case ENOTCAPABLE            = 93
+    /// Not permitted in capability mode
+    case ECAPMODE               = 94
+    /// State not recoverable
+    case ENOTRECOVERABLE        = 95
+    /// Previous owner died
+    case EOWNERDEAD             = 96
+    /// Integrity check failed
+    case EINTEGRITY             = 97
+#endif
 }
 
 #endif

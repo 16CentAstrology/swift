@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2024 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -25,10 +25,14 @@ public typealias CUnsignedChar = UInt8
 public typealias CUnsignedShort = UInt16
 
 /// The C 'unsigned int' type.
+#if  _pointerBitWidth(_16)
+public typealias CUnsignedInt = UInt
+#else
 public typealias CUnsignedInt = UInt32
+#endif
 
 /// The C 'unsigned long' type.
-#if os(Windows) && (arch(x86_64) || arch(arm64))
+#if (os(Windows) && (arch(x86_64) || arch(arm64))) || _pointerBitWidth(_16)
 public typealias CUnsignedLong = UInt32
 #else
 public typealias CUnsignedLong = UInt
@@ -44,10 +48,14 @@ public typealias CSignedChar = Int8
 public typealias CShort = Int16
 
 /// The C 'int' type.
+#if  _pointerBitWidth(_16)
+public typealias CInt = Int
+#else
 public typealias CInt = Int32
+#endif
 
 /// The C 'long' type.
-#if os(Windows) && (arch(x86_64) || arch(arm64))
+#if (os(Windows) && (arch(x86_64) || arch(arm64))) || _pointerBitWidth(_16)
 public typealias CLong = Int32
 #else
 public typealias CLong = Int
@@ -69,7 +77,7 @@ public typealias CFloat = Float
 public typealias CDouble = Double
 
 /// The C 'long double' type.
-#if os(macOS) || os(iOS) || os(watchOS) || os(tvOS)
+#if os(macOS) || os(iOS) || os(watchOS) || os(tvOS) || os(visionOS)
 // On Darwin, long double is Float80 on x86, and Double otherwise.
 #if arch(x86_64) || arch(i386)
 public typealias CLongDouble = Float80
@@ -100,6 +108,8 @@ public typealias CLongDouble = Double
 #elseif os(OpenBSD)
 #if arch(x86_64)
 public typealias CLongDouble = Float80
+#elseif arch(arm64)
+public typealias CLongDouble = Double
 #else
 #error("CLongDouble needs to be defined for this OpenBSD architecture")
 #endif
@@ -109,6 +119,10 @@ public typealias CLongDouble = Float80
 #else
 #error("CLongDouble needs to be defined for this FreeBSD architecture")
 #endif
+#elseif $Embedded
+#if arch(x86_64) || arch(i386)
+public typealias CLongDouble = Double
+#endif
 #else
 // TODO: define CLongDouble for other OSes
 #endif
@@ -116,7 +130,14 @@ public typealias CLongDouble = Float80
 // FIXME: Is it actually UTF-32 on Darwin?
 //
 /// The C++ 'wchar_t' type.
+#if os(Windows)
+public typealias CWideChar = UInt16
+#else
 public typealias CWideChar = Unicode.Scalar
+#endif
+
+/// The C++20 'char8_t' type, which has UTF-8 encoding.
+public typealias CChar8 = UInt8
 
 // FIXME: Swift should probably have a UTF-16 type other than UInt16.
 //
@@ -134,6 +155,7 @@ public typealias CBool = Bool
 /// Opaque pointers are used to represent C pointers to types that
 /// cannot be represented in Swift, such as incomplete struct types.
 @frozen
+@unsafe
 public struct OpaquePointer {
   @usableFromInline
   internal var _rawValue: Builtin.RawPointer
@@ -142,24 +164,40 @@ public struct OpaquePointer {
   internal init(_ v: Builtin.RawPointer) {
     self._rawValue = v
   }
+}
 
-  /// Creates an `OpaquePointer` from a given address in memory.
+@available(*, unavailable)
+extension OpaquePointer: Sendable {}
+
+extension OpaquePointer {
+  /// Creates a new `OpaquePointer` from the given address, specified as a bit
+  /// pattern.
+  ///
+  /// - Parameter bitPattern: A bit pattern to use for the address of the new
+  ///   pointer. If `bitPattern` is zero, the result is `nil`.
   @_transparent
   public init?(bitPattern: Int) {
     if bitPattern == 0 { return nil }
     self._rawValue = Builtin.inttoptr_Word(bitPattern._builtinWordValue)
   }
 
-  /// Creates an `OpaquePointer` from a given address in memory.
+  /// Creates a new `OpaquePointer` from the given address, specified as a bit
+  /// pattern.
+  ///
+  /// - Parameter bitPattern: A bit pattern to use for the address of the new
+  ///   pointer. If `bitPattern` is zero, the result is `nil`.
   @_transparent
   public init?(bitPattern: UInt) {
     if bitPattern == 0 { return nil }
     self._rawValue = Builtin.inttoptr_Word(bitPattern._builtinWordValue)
   }
+}
 
+extension OpaquePointer {
   /// Converts a typed `UnsafePointer` to an opaque C pointer.
   @_transparent
-  public init<T>(@_nonEphemeral _ from: UnsafePointer<T>) {
+  @_preInverseGenerics
+  public init<T: ~Copyable>(@_nonEphemeral _ from: UnsafePointer<T>) {
     self._rawValue = from._rawValue
   }
 
@@ -167,14 +205,18 @@ public struct OpaquePointer {
   ///
   /// The result is `nil` if `from` is `nil`.
   @_transparent
-  public init?<T>(@_nonEphemeral _ from: UnsafePointer<T>?) {
+  @_preInverseGenerics
+  public init?<T: ~Copyable>(@_nonEphemeral _ from: UnsafePointer<T>?) {
     guard let unwrapped = from else { return nil }
     self.init(unwrapped)
   }
+}
 
+extension OpaquePointer {
   /// Converts a typed `UnsafeMutablePointer` to an opaque C pointer.
   @_transparent
-  public init<T>(@_nonEphemeral _ from: UnsafeMutablePointer<T>) {
+  @_preInverseGenerics
+  public init<T: ~Copyable>(@_nonEphemeral _ from: UnsafeMutablePointer<T>) {
     self._rawValue = from._rawValue
   }
 
@@ -182,7 +224,8 @@ public struct OpaquePointer {
   ///
   /// The result is `nil` if `from` is `nil`.
   @_transparent
-  public init?<T>(@_nonEphemeral _ from: UnsafeMutablePointer<T>?) {
+  @_preInverseGenerics
+  public init?<T: ~Copyable>(@_nonEphemeral _ from: UnsafeMutablePointer<T>?) {
     guard let unwrapped = from else { return nil }
     self.init(unwrapped)
   }
@@ -207,6 +250,7 @@ extension OpaquePointer: Hashable {
   }
 }
 
+@_unavailableInEmbedded
 extension OpaquePointer: CustomDebugStringConvertible {
   /// A textual representation of the pointer, suitable for debugging.
   public var debugDescription: String {
@@ -243,8 +287,9 @@ extension UInt {
 }
 
 /// A wrapper around a C `va_list` pointer.
-#if arch(arm64) && !(os(macOS) || os(iOS) || os(tvOS) || os(watchOS) || os(Windows))
+#if arch(arm64) && !(os(macOS) || os(iOS) || os(tvOS) || os(watchOS) || os(visionOS) ||  os(Windows))
 @frozen
+@unsafe
 public struct CVaListPointer {
   @usableFromInline // unsafe-performance
   internal var _value: (__stack: UnsafeMutablePointer<Int>?,
@@ -264,6 +309,7 @@ public struct CVaListPointer {
   }
 }
 
+@_unavailableInEmbedded
 extension CVaListPointer: CustomDebugStringConvertible {
   public var debugDescription: String {
     return "(\(_value.__stack.debugDescription), " +
@@ -277,6 +323,7 @@ extension CVaListPointer: CustomDebugStringConvertible {
 #else
 
 @frozen
+@unsafe
 public struct CVaListPointer {
   @usableFromInline // unsafe-performance
   internal var _value: UnsafeMutableRawPointer
@@ -288,6 +335,7 @@ public struct CVaListPointer {
   }
 }
 
+@_unavailableInEmbedded
 extension CVaListPointer: CustomDebugStringConvertible {
   /// A textual representation of the pointer, suitable for debugging.
   public var debugDescription: String {
@@ -296,6 +344,9 @@ extension CVaListPointer: CustomDebugStringConvertible {
 }
 
 #endif
+
+@available(*, unavailable)
+extension CVaListPointer: Sendable { }
 
 /// Copy `size` bytes of memory from `src` into `dest`.
 ///

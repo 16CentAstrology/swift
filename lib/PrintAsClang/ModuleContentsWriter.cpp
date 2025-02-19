@@ -20,13 +20,18 @@
 #include "PrintSwiftToClangCoreScaffold.h"
 #include "SwiftToClangInteropContext.h"
 
+#include "swift/AST/Decl.h"
+#include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/SwiftNameTranslation.h"
 #include "swift/AST/TypeDeclFinder.h"
+#include "swift/Basic/Assertions.h"
+#include "swift/Basic/SourceManager.h"
 #include "swift/ClangImporter/ClangImporter.h"
+#include "swift/SIL/SILInstruction.h"
 #include "swift/Strings.h"
 
 #include "clang/AST/Decl.h"
@@ -59,7 +64,7 @@ class ReferencedTypeFinder : public TypeDeclFinder {
 
   Action visitNominalType(NominalType *nominal) override {
     Callback(*this, nominal->getDecl());
-    return Action::SkipChildren;
+    return Action::SkipNode;
   }
 
   Action visitTypeAliasType(TypeAliasType *aliasTy) override {
@@ -69,17 +74,15 @@ class ReferencedTypeFinder : public TypeDeclFinder {
     } else {
       Type(aliasTy->getSinglyDesugaredType()).walk(*this);
     }
-    return Action::SkipChildren;
+    return Action::SkipNode;
   }
 
   /// Returns true if \p paramTy has any constraints other than being
   /// class-bound ("conforms to" AnyObject).
   static bool isConstrained(GenericSignature sig,
                             GenericTypeParamType *paramTy) {
-    if (sig->getSuperclassBound(paramTy))
-      return true;
-
-    return !sig->getRequiredProtocols(paramTy).empty();
+    auto existentialTy = sig->getExistentialType(paramTy);
+    return !(existentialTy->isAny() || existentialTy->isAnyObject());
   }
 
   Action visitBoundGenericType(BoundGenericType *boundGeneric) override {
@@ -101,7 +104,7 @@ class ReferencedTypeFinder : public TypeDeclFinder {
       argTy.walk(*this);
       NeedsDefinition = false;
     });
-    return Action::SkipChildren;
+    return Action::SkipNode;
   }
 
 public:
@@ -115,11 +118,7 @@ public:
 };
 
 class ModuleWriter {
-  enum class EmissionState {
-    NotYetDefined = 0,
-    DefinitionRequested,
-    Defined
-  };
+  enum class EmissionState { NotYetDefined = 0, DefinitionRequested, Defined };
 
   raw_ostream &os;
   SmallPtrSetImpl<ImportModuleTy> &imports;
@@ -128,7 +127,8 @@ class ModuleWriter {
   llvm::DenseMap<const TypeDecl *, std::pair<EmissionState, bool>> seenTypes;
   llvm::DenseSet<const clang::Type *> seenClangTypes;
   std::vector<const Decl *> declsToWrite;
-  DelayedMemberSet delayedMembers;
+  DelayedMemberSet objcDelayedMembers;
+  CxxDeclEmissionScope topLevelEmissionScope;
   PrimitiveTypeMapping typeMapping;
   std::string outOfLineDefinitions;
   llvm::raw_string_ostream outOfLineDefinitionsOS;
@@ -140,12 +140,13 @@ public:
   ModuleWriter(raw_ostream &os, raw_ostream &prologueOS,
                llvm::SmallPtrSetImpl<ImportModuleTy> &imports, ModuleDecl &mod,
                SwiftToClangInteropContext &interopContext, AccessLevel access,
-               bool requiresExposedAttribute, OutputLanguageMode outputLang)
+               bool requiresExposedAttribute, llvm::StringSet<> &exposedModules,
+               OutputLanguageMode outputLang)
       : os(os), imports(imports), M(mod),
         outOfLineDefinitionsOS(outOfLineDefinitions),
-        printer(M, os, prologueOS, outOfLineDefinitionsOS, delayedMembers,
-                typeMapping, interopContext, access, requiresExposedAttribute,
-                outputLang),
+        printer(M, os, prologueOS, outOfLineDefinitionsOS, objcDelayedMembers,
+                topLevelEmissionScope, typeMapping, interopContext, access,
+                requiresExposedAttribute, exposedModules, outputLang),
         outputLangMode(outputLang) {}
 
   PrimitiveTypeMapping &getTypeMapping() { return typeMapping; }
@@ -190,11 +191,15 @@ public:
     }
 
     if (outputLangMode == OutputLanguageMode::Cxx) {
-      // Only add C++ imports in C++ mode for now.
-      if (!D->hasClangNode())
-        return true;
+      // Do not expose compiler private '_ObjC' module.
       if (otherModule->getName().str() == CLANG_HEADER_MODULE_NAME)
         return true;
+      // Add C++ module imports in C++ mode explicitly, to ensure that their
+      // import is always emitted in the header.
+      if (D->hasClangNode()) {
+        if (auto *clangMod = otherModule->findUnderlyingClangModule())
+          imports.insert(clangMod);
+      }
     }
 
     imports.insert(otherModule);
@@ -214,7 +219,10 @@ public:
     return state.first == EmissionState::Defined;
   }
 
-  bool require(const TypeDecl *D) {
+  bool require(const TypeDecl *D) { return requireTypes(D, declsToWrite); }
+
+  template <typename T>
+  bool requireTypes(const TypeDecl *D, T &types) {
     if (addImport(D)) {
       seenTypes[D] = { EmissionState::Defined, true };
       return true;
@@ -225,7 +233,7 @@ public:
     case EmissionState::NotYetDefined:
     case EmissionState::DefinitionRequested:
       state.first = EmissionState::DefinitionRequested;
-      declsToWrite.push_back(D);
+      types.push_back(D);
       return false;
     case EmissionState::Defined:
       return true;
@@ -280,26 +288,27 @@ public:
     if (!isa<clang::TypeDecl>(typeDecl->getClangDecl()))
       return;
     // Get the underlying clang type from a type alias decl or record decl.
-    auto clangType =
-        clang::QualType(
-            cast<clang::TypeDecl>(typeDecl->getClangDecl())->getTypeForDecl(),
-            0)
-            .getCanonicalType();
+    auto clangDecl = typeDecl->getClangDecl();
+    auto clangType = clangDecl->getASTContext()
+                         .getTypeDeclType(cast<clang::TypeDecl>(clangDecl))
+                         .getCanonicalType();
     if (!isa<clang::RecordType>(clangType.getTypePtr()))
       return;
     auto it = seenClangTypes.insert(clangType.getTypePtr());
     if (it.second)
-      ClangValueTypePrinter::printClangTypeSwiftGenericTraits(os, typeDecl, &M);
+      ClangValueTypePrinter::printClangTypeSwiftGenericTraits(os, typeDecl, &M,
+                                                              printer);
   }
 
   void forwardDeclareCxxValueTypeIfNeeded(const NominalTypeDecl *NTD) {
-    forwardDeclare(NTD,
-                   [&]() { ClangValueTypePrinter::forwardDeclType(os, NTD); });
+    forwardDeclare(NTD, [&]() {
+      ClangValueTypePrinter::forwardDeclType(os, NTD, printer);
+    });
   }
 
   void forwardDeclareType(const TypeDecl *TD) {
     if (outputLangMode == OutputLanguageMode::Cxx) {
-      if (isa<StructDecl>(TD) || isa<EnumDecl>(TD)) {
+      if (isa<StructDecl>(TD) || isa<EnumDecl>(TD) || isa<ClassDecl>(TD)) {
         auto *NTD = cast<NominalTypeDecl>(TD);
         if (!addImport(NTD))
           forwardDeclareCxxValueTypeIfNeeded(NTD);
@@ -316,7 +325,8 @@ public:
         (void)addImport(CD);
       }
     } else if (auto PD = dyn_cast<ProtocolDecl>(TD)) {
-      forwardDeclare(PD);
+      if (!PD->isMarkerProtocol())
+        forwardDeclare(PD);
     } else if (auto TAD = dyn_cast<TypeAliasDecl>(TD)) {
       bool imported = false;
       if (TAD->hasClangNode())
@@ -340,7 +350,8 @@ public:
     }
   }
 
-  bool forwardDeclareMemberTypes(DeclRange members, const Decl *container) {
+  bool forwardDeclareMemberTypes(ArrayRef<Decl *> members,
+                                 const Decl *container) {
     PrettyStackTraceDecl
         entry("printing forward declarations needed by members of", container);
     switch (container->getKind()) {
@@ -358,7 +369,7 @@ public:
     }
 
     bool hadAnyDelayedMembers = false;
-    SmallVector<ValueDecl *, 4> nestedTypes;
+    SmallVector<const ValueDecl *, 4> nestedTypes;
     for (auto member : members) {
       PrettyStackTraceDecl loopEntry("printing for member", member);
       auto VD = dyn_cast<ValueDecl>(member);
@@ -366,15 +377,23 @@ public:
         continue;
 
       // Catch nested types and emit their definitions /after/ this class.
-      if (isa<TypeDecl>(VD)) {
-        // Don't emit nested types that are just implicitly @objc.
-        // You should have to opt into this, since they are even less
-        // namespaced than usual.
-        if (std::any_of(VD->getAttrs().begin(), VD->getAttrs().end(),
-                        [](const DeclAttribute *attr) {
-                          return isa<ObjCAttr>(attr) && !attr->isImplicit();
-                        })) {
-          nestedTypes.push_back(VD);
+      if (const auto *TD = dyn_cast<TypeDecl>(VD)) {
+        if (outputLangMode == OutputLanguageMode::Cxx) {
+          if (!isa<TypeAliasDecl>(TD) && !isStringNestedType(VD, "UTF8View") &&
+              !isStringNestedType(VD, "Index")) {
+            forwardDeclareType(TD);
+            requireTypes(TD, nestedTypes);
+          }
+        } else {
+          // Don't emit nested types that are just implicitly @objc.
+          // You should have to opt into this, since they are even less
+          // namespaced than usual.
+          if (std::any_of(VD->getAttrs().begin(), VD->getAttrs().end(),
+                          [](const DeclAttribute *attr) {
+                            return isa<ObjCAttr>(attr) && !attr->isImplicit();
+                          })) {
+            nestedTypes.push_back(VD);
+          }
         }
         continue;
       }
@@ -429,7 +448,7 @@ public:
 
       if (needsToBeIndividuallyDelayed) {
         assert(isa<ClassDecl>(container));
-        delayedMembers.insert(VD);
+        objcDelayedMembers.insert(VD);
       }
     }
 
@@ -462,9 +481,13 @@ public:
     if (!allRequirementsSatisfied)
       return false;
 
-    (void)forwardDeclareMemberTypes(CD->getMembers(), CD);
-    seenTypes[CD] = { EmissionState::Defined, true };
-    os << '\n';
+    (void)forwardDeclareMemberTypes(CD->getAllMembers(), CD);
+    auto [it, inserted] =
+        seenTypes.try_emplace(CD, EmissionState::NotYetDefined, false);
+    if (outputLangMode == OutputLanguageMode::Cxx &&
+        (inserted || !it->second.second))
+      ClangValueTypePrinter::forwardDeclType(os, CD, printer);
+    it->second = {EmissionState::Defined, true};
     printer.print(CD);
     return true;
   }
@@ -483,7 +506,6 @@ public:
           forwardDeclareType(TD);
         });
 
-    os << '\n';
     printer.print(FD);
     return true;
   }
@@ -492,10 +514,10 @@ public:
     if (addImport(SD))
       return true;
     if (outputLangMode == OutputLanguageMode::Cxx) {
-      (void)forwardDeclareMemberTypes(SD->getMembers(), SD);
+      (void)forwardDeclareMemberTypes(SD->getAllMembers(), SD);
       for (const auto *ed :
            printer.getInteropContext().getExtensionsForNominalType(SD)) {
-        (void)forwardDeclareMemberTypes(ed->getMembers(), SD);
+        (void)forwardDeclareMemberTypes(ed->getAllMembers(), SD);
       }
       forwardDeclareCxxValueTypeIfNeeded(SD);
     }
@@ -522,11 +544,10 @@ public:
     if (!allRequirementsSatisfied)
       return false;
 
-    if (!forwardDeclareMemberTypes(PD->getMembers(), PD))
+    if (!forwardDeclareMemberTypes(PD->getAllMembers(), PD))
       return false;
 
     seenTypes[PD] = { EmissionState::Defined, true };
-    os << '\n';
     printer.print(PD);
     return true;
   }
@@ -549,10 +570,9 @@ public:
     // This isn't rolled up into the previous set of requirements because
     // it /also/ prints forward declarations, and the header is a little
     // prettier if those are as close as possible to the necessary extension.
-    if (!forwardDeclareMemberTypes(ED->getMembers(), ED))
+    if (!forwardDeclareMemberTypes(ED->getAllMembers(), ED))
       return false;
 
-    os << '\n';
     printer.print(ED);
     return true;
   }
@@ -562,7 +582,7 @@ public:
       return true;
 
     if (outputLangMode == OutputLanguageMode::Cxx) {
-      forwardDeclareMemberTypes(ED->getMembers(), ED);
+      forwardDeclareMemberTypes(ED->getAllMembers(), ED);
       forwardDeclareCxxValueTypeIfNeeded(ED);
     }
 
@@ -594,22 +614,29 @@ public:
 
   void write() {
     SmallVector<Decl *, 64> decls;
-    M.getTopLevelDecls(decls);
+    M.getTopLevelDeclsWithAuxiliaryDecls(decls);
+    llvm::DenseSet<const ValueDecl *> removedValueDecls;
 
-    auto newEnd = std::remove_if(decls.begin(), decls.end(),
-                                 [this](const Decl *D) -> bool {
-      if (auto VD = dyn_cast<ValueDecl>(D))
-        return !printer.shouldInclude(VD);
+    auto newEnd =
+        std::remove_if(decls.begin(), decls.end(),
+                       [this, &removedValueDecls](const Decl *D) -> bool {
+                         if (auto VD = dyn_cast<ValueDecl>(D)) {
+                           auto shouldRemove = !printer.shouldInclude(VD);
+                           if (shouldRemove)
+                             removedValueDecls.insert(VD);
+                           return shouldRemove;
+                         }
 
-      if (auto ED = dyn_cast<ExtensionDecl>(D)) {
-        if (outputLangMode == OutputLanguageMode::Cxx)
-          return false;
-        auto baseClass = ED->getSelfClassDecl();
-        return !baseClass || !printer.shouldInclude(baseClass) ||
-               baseClass->isForeign();
-      }
-      return true;
-    });
+                         if (auto ED = dyn_cast<ExtensionDecl>(D)) {
+                           if (outputLangMode == OutputLanguageMode::Cxx)
+                             return false;
+                           auto baseClass = ED->getSelfClassDecl();
+                           return !baseClass ||
+                                  !printer.shouldInclude(baseClass) ||
+                                  baseClass->isForeign();
+                         }
+                         return true;
+                       });
     decls.erase(newEnd, decls.end());
 
     if (M.isStdlibModule()) {
@@ -619,7 +646,7 @@ public:
         if (!ext ||
             ext->getExtendedNominal() != M.getASTContext().getStringDecl())
           continue;
-        for (auto *m : ext->getMembers()) {
+        for (auto *m : ext->getAllMembers()) {
           if (auto *sd = dyn_cast<StructDecl>(m)) {
             if (sd->getBaseIdentifier().str() == "UTF8View" ||
                 sd->getBaseIdentifier().str() == "Index") {
@@ -655,23 +682,84 @@ public:
         llvm_unreachable("unknown top-level ObjC decl");
       };
 
+      // When we visit a function, we might also generate a thunk that calls into the
+      // implementation of structs/enums to get the opaque pointers. To avoid
+      // referencing these methods before we see the definition for the generated
+      // classes, we want to visit function definitions last.
+      if (isa<AbstractFunctionDecl>(*rhs) && isa<NominalTypeDecl>(*lhs))
+        return Descending;
+      if (isa<AbstractFunctionDecl>(*lhs) && isa<NominalTypeDecl>(*rhs))
+        return Ascending;
+
       // Sort by names.
       int result = getSortName(*rhs).compare(getSortName(*lhs));
       if (result != 0)
         return result;
+      // Two overloaded functions can have the same name when emitting C++.
+      if (isa<AbstractFunctionDecl>(*rhs) && isa<AbstractFunctionDecl>(*lhs)) {
+        // Sort top level functions with the same C++ name by their location to
+        // have stable sorting that depends on users source but not on the
+        // compiler invocation.
+        // FIXME: This is pretty suspect; PrintAsClang sometimes operates on
+        //        serialized modules which don't have SourceLocs, so this sort
+        //        rule may be applied in some steps of a build but not others.
+        if ((*rhs)->getLoc().isValid() && (*lhs)->getLoc().isValid()) {
+          auto getLocText = [](const Decl *afd) {
+            std::string res;
+            llvm::raw_string_ostream os(res);
+            afd->getLoc().print(os, afd->getASTContext().SourceMgr);
+            return std::move(os.str());
+          };
+
+          result = getLocText(*rhs).compare(getLocText(*lhs));
+          if (result != 0)
+            return result;
+        }
+      }
+
+      // A function and a global variable can have the same name in C++,
+      // even when the variable might not actually be emitted by the emitter.
+      // In that case, order the function before the variable.
+      if (isa<AbstractFunctionDecl>(*rhs) && isa<VarDecl>(*lhs))
+        return Descending;
+      if (isa<AbstractFunctionDecl>(*lhs) && isa<VarDecl>(*rhs))
+        return Ascending;
 
       // Prefer value decls to extensions.
-      assert(!(isa<ValueDecl>(*lhs) && isa<ValueDecl>(*rhs)));
       if (isa<ValueDecl>(*lhs) && !isa<ValueDecl>(*rhs))
         return Descending;
       if (!isa<ValueDecl>(*lhs) && isa<ValueDecl>(*rhs))
         return Ascending;
 
+      // Last-ditch ValueDecl tiebreaker: Compare mangled names. This captures
+      // *tons* of context and detail missed by the previous checks, but the
+      // resulting sort makes little sense to humans.
+      // FIXME: It'd be nice to share the mangler or even memoize mangled names,
+      //        but we'd have to stop using `llvm::array_pod_sort()` so that we
+      //        could capture some outside state.
+      Mangle::ASTMangler mangler((*lhs)->getASTContext());
+      auto getMangledName = [&](const Decl *D) {
+        auto VD = dyn_cast<ValueDecl>(D);
+        if (!VD && isa<ExtensionDecl>(D))
+          VD = cast<ExtensionDecl>(D)->getExtendedNominal();
+        if (!VD)
+          return std::string();
+        return mangler.mangleAnyDecl(VD, /*prefix=*/true,
+                                     /*respectOriginallyDefinedIn=*/true);
+      };
+      result = getMangledName(*rhs).compare(getMangledName(*lhs));
+      if (result != 0)
+        return result;
+
+      // Mangled names ought to distinguish all value decls, leaving only
+      // extensions of the same nominal type beyond this point.
+      assert(isa<ExtensionDecl>(*lhs) && isa<ExtensionDecl>(*rhs));
+
       // Break ties in extensions by putting smaller extensions last (in reverse
       // order).
       // FIXME: This will end up taking linear time.
-      auto lhsMembers = cast<ExtensionDecl>(*lhs)->getMembers();
-      auto rhsMembers = cast<ExtensionDecl>(*rhs)->getMembers();
+      auto lhsMembers = cast<ExtensionDecl>(*lhs)->getAllMembers();
+      auto rhsMembers = cast<ExtensionDecl>(*rhs)->getAllMembers();
       unsigned numLHSMembers = std::distance(lhsMembers.begin(),
                                              lhsMembers.end());
       unsigned numRHSMembers = std::distance(rhsMembers.begin(),
@@ -687,16 +775,49 @@ public:
 
       // If that fails, arbitrarily pick the extension whose protocols are
       // alphabetically first.
-      auto mismatch =
-        std::mismatch(lhsProtos.begin(), lhsProtos.end(), rhsProtos.begin(),
-                      [] (const ProtocolDecl *nextLHSProto,
-                          const ProtocolDecl *nextRHSProto) {
-        return nextLHSProto->getName() != nextRHSProto->getName();
-      });
-      if (mismatch.first == lhsProtos.end())
-        return Equivalent;
-      StringRef lhsProtoName = (*mismatch.first)->getName().str();
-      return lhsProtoName.compare((*mismatch.second)->getName().str());
+      {
+        auto mismatch =
+          std::mismatch(lhsProtos.begin(), lhsProtos.end(), rhsProtos.begin(),
+                        [] (const ProtocolDecl *nextLHSProto,
+                            const ProtocolDecl *nextRHSProto) {
+          return nextLHSProto->getName() != nextRHSProto->getName();
+        });
+        if (mismatch.first != lhsProtos.end()) {
+          StringRef lhsProtoName = (*mismatch.first)->getName().str();
+          return lhsProtoName.compare((*mismatch.second)->getName().str());
+        }
+      }
+
+      // Still nothing? Fine, we'll pick the one with the alphabetically first
+      // member instead.
+      {
+        auto mismatch = std::mismatch(
+            cast<ExtensionDecl>(*lhs)->getAllMembers().begin(),
+            cast<ExtensionDecl>(*lhs)->getAllMembers().end(),
+            cast<ExtensionDecl>(*rhs)->getAllMembers().begin(),
+            [](const Decl *nextLHSDecl, const Decl *nextRHSDecl) {
+              if (isa<ValueDecl>(nextLHSDecl) && isa<ValueDecl>(nextRHSDecl)) {
+                return cast<ValueDecl>(nextLHSDecl)->getName() !=
+                       cast<ValueDecl>(nextRHSDecl)->getName();
+              }
+              return isa<ValueDecl>(nextLHSDecl) != isa<ValueDecl>(nextRHSDecl);
+            });
+        if (mismatch.first !=
+            cast<ExtensionDecl>(*lhs)->getAllMembers().end()) {
+          auto *lhsMember = dyn_cast<ValueDecl>(*mismatch.first),
+               *rhsMember = dyn_cast<ValueDecl>(*mismatch.second);
+          if (!rhsMember && lhsMember)
+            return Descending;
+          if (lhsMember && !rhsMember)
+            return Ascending;
+          if (lhsMember && rhsMember)
+            return rhsMember->getName().compare(lhsMember->getName());
+        }
+      }
+
+      // Hopefully two extensions with identical conformances and member names
+      // will be interchangeable enough not to matter.
+      return Equivalent;
     });
 
     assert(declsToWrite.empty());
@@ -706,7 +827,7 @@ public:
       for (const Decl *D : declsToWrite) {
         if (auto *ED = dyn_cast<ExtensionDecl>(D)) {
           const auto *type = ED->getExtendedNominal();
-          if (isa<StructDecl>(type))
+          if (isa<StructDecl>(type) || isa<EnumDecl>(type))
             printer.getInteropContext().recordExtensions(type, ED);
         }
       }
@@ -715,6 +836,7 @@ public:
     while (!declsToWrite.empty()) {
       const Decl *D = declsToWrite.back();
       bool success = true;
+      auto posBefore = os.tell();
 
       if (auto ED = dyn_cast<EnumDecl>(D)) {
         success = writeEnum(ED);
@@ -723,9 +845,11 @@ public:
       } else if (outputLangMode == OutputLanguageMode::Cxx) {
         if (auto FD = dyn_cast<FuncDecl>(D))
           success = writeFunc(FD);
-        if (auto SD = dyn_cast<StructDecl>(D))
+        else if (auto SD = dyn_cast<StructDecl>(D))
           success = writeStruct(SD);
-        // FIXME: Warn on unsupported exported decl.
+        else if (auto *vd = dyn_cast<ValueDecl>(D))
+          topLevelEmissionScope.additionalUnrepresentableDeclarations.push_back(
+              vd);
       } else if (isa<ValueDecl>(D)) {
         if (auto PD = dyn_cast<ProtocolDecl>(D))
           success = writeProtocol(PD);
@@ -743,24 +867,129 @@ public:
 
       if (success) {
         assert(declsToWrite.back() == D);
-        os << "\n";
+        // If we actually wrote something to the file, add a newline after it.
+        // (As opposed to, for instance, an extension we decided to skip.)
+        if (posBefore != os.tell())
+          os << "\n";
         declsToWrite.pop_back();
       }
     }
 
-    if (!delayedMembers.empty()) {
-      auto groupBegin = delayedMembers.begin();
-      for (auto i = groupBegin, e = delayedMembers.end(); i != e; ++i) {
-        if ((*i)->getDeclContext() != (*groupBegin)->getDeclContext()) {
-          printer.printAdHocCategory(make_range(groupBegin, i));
-          groupBegin = i;
+    if (outputLangMode == OutputLanguageMode::ObjC)
+      if (!objcDelayedMembers.empty()) {
+        auto groupBegin = objcDelayedMembers.begin();
+        for (auto i = groupBegin, e = objcDelayedMembers.end(); i != e; ++i) {
+          if ((*i)->getDeclContext() != (*groupBegin)->getDeclContext()) {
+            printer.printAdHocCategory(make_range(groupBegin, i));
+            groupBegin = i;
+          }
         }
+        printer.printAdHocCategory(
+            make_range(groupBegin, objcDelayedMembers.end()));
       }
-      printer.printAdHocCategory(make_range(groupBegin, delayedMembers.end()));
-    }
 
     // Print any out of line definitions.
     os << outOfLineDefinitionsOS.str();
+
+    // In C++ section, emit unavailable stubs for top value level
+    // declarations that couldn't be represented in C++.
+    if (outputLangMode != OutputLanguageMode::Cxx)
+      return;
+    auto &emissionScope = topLevelEmissionScope;
+    auto removedVDList = std::vector<const ValueDecl *>(
+        removedValueDecls.begin(), removedValueDecls.end());
+    for (const auto *removedVD :
+         emissionScope.additionalUnrepresentableDeclarations)
+      removedVDList.push_back(removedVD);
+
+    // Do not report internal/private decls as unavailable.
+    // @objc declarations are emitted in the Objective-C section, so do not
+    // report them as unavailable. Also skip underscored decls from the standard
+    // library. Also skip structs from the standard library, they can cause
+    // ambiguities because of the arithmetic types that conflict with types we
+    // already have in `swift::` namespace. Also skip `Error` protocol from
+    // stdlib, we have experimental support for it.
+    removedVDList.erase(
+        llvm::remove_if(
+            removedVDList,
+            [&](const ValueDecl *vd) {
+              return !printer.isVisible(vd) || vd->isObjC() ||
+                     (vd->isStdlibDecl() && !vd->getName().isSpecial() &&
+                      vd->getBaseIdentifier().hasUnderscoredNaming()) ||
+                     (vd->isStdlibDecl() && isa<StructDecl>(vd)) ||
+                     (vd->isStdlibDecl() &&
+                      vd->getASTContext().getErrorDecl() == vd);
+            }),
+        removedVDList.end());
+    // Sort the unavaiable decls by their name and kind.
+    llvm::sort(removedVDList, [](const ValueDecl *lhs, const ValueDecl *rhs) {
+      auto getSortKey = [](const ValueDecl *vd) {
+        std::string sortKey;
+        llvm::raw_string_ostream os(sortKey);
+        vd->getName().print(os);
+        os << ' ' << (unsigned)vd->getDescriptiveKind();
+        return std::move(os.str());
+      };
+      return getSortKey(lhs) < getSortKey(rhs);
+    });
+
+    for (const auto *vd : removedVDList) {
+      assert(!vd->isObjC());
+      os << "\n";
+      auto emitStubComment = [&]() {
+        // Emit a generic comment for an handled declaration.
+        os << "// Unavailable in C++: Swift "
+           << vd->getDescriptiveKindName(vd->getDescriptiveKind()) << " '";
+        vd->getName().print(os);
+        os << "'.\n";
+      };
+
+      // Do not emit a C++ declaration with a specific C++ name more than once.
+      auto cxxName = cxx_translation::getNameForCxx(vd);
+      if (emissionScope.emittedDeclarationNames.contains(cxxName)) {
+        emitStubComment();
+        continue;
+      }
+      emissionScope.emittedDeclarationNames.insert(cxxName);
+
+      // Emit an unavailable stub for a Swift type.
+      if (auto *nmtd = dyn_cast<NominalTypeDecl>(vd)) {
+        auto representation = cxx_translation::getDeclRepresentation(
+            vd, [this](const NominalTypeDecl *decl) {
+              return printer.isZeroSized(decl);
+            });
+        if (nmtd->isGeneric()) {
+          auto genericSignature =
+              nmtd->getGenericSignature().getCanonicalSignature();
+          ClangSyntaxPrinter(nmtd->getASTContext(), os).printGenericSignature(genericSignature);
+        }
+        os << "class ";
+        ClangSyntaxPrinter(nmtd->getASTContext(), os).printBaseName(vd);
+        os << " { } SWIFT_UNAVAILABLE_MSG(\"";
+
+        auto diag =
+            representation.isUnsupported() && representation.error.has_value()
+                ? cxx_translation::diagnoseRepresenationError(
+                      *representation.error, const_cast<ValueDecl *>(vd))
+                : Diagnostic(
+                      vd->isStdlibDecl() ? diag::unexposed_other_decl_in_cxx
+                                         : diag::unsupported_other_decl_in_cxx,
+                      const_cast<ValueDecl *>(vd));
+        // Emit a specific unavailable message when we know why a decl can't be
+        // exposed, or a generic message otherwise.
+        auto diagString =
+            M.getASTContext().Diags.diagnosticStringFor(diag.getID());
+        DiagnosticEngine::formatDiagnosticText(os, diagString, diag.getArgs(),
+                                               DiagnosticFormatOptions());
+        os << "\");\n";
+        continue;
+      }
+
+      // FIXME: Emit an unavailable stub for a function / function overload set
+      // / variable.
+      // FIXME: Note unrepresented type aliases too.
+      emitStubComment();
+    }
   }
 };
 } // end anonymous namespace
@@ -773,25 +1002,34 @@ void swift::printModuleContentsAsObjC(
     raw_ostream &os, llvm::SmallPtrSetImpl<ImportModuleTy> &imports,
     ModuleDecl &M, SwiftToClangInteropContext &interopContext) {
   llvm::raw_null_ostream prologueOS;
+  llvm::StringSet<> exposedModules;
   ModuleWriter(os, prologueOS, imports, M, interopContext, getRequiredAccess(M),
-               /*requiresExposedAttribute=*/false, OutputLanguageMode::ObjC)
+               /*requiresExposedAttribute=*/false, exposedModules,
+               OutputLanguageMode::ObjC)
       .write();
 }
 
 EmittedClangHeaderDependencyInfo swift::printModuleContentsAsCxx(
-    raw_ostream &os,
-    ModuleDecl &M, SwiftToClangInteropContext &interopContext,
-    bool requiresExposedAttribute) {
+    raw_ostream &os, ModuleDecl &M, SwiftToClangInteropContext &interopContext,
+    bool requiresExposedAttribute, llvm::StringSet<> &exposedModules) {
   std::string moduleContentsBuf;
   llvm::raw_string_ostream moduleOS{moduleContentsBuf};
   std::string modulePrologueBuf;
   llvm::raw_string_ostream prologueOS{modulePrologueBuf};
   EmittedClangHeaderDependencyInfo info;
 
+  // Define the `SWIFT_SYMBOL` macro.
+  os << "#ifdef SWIFT_SYMBOL\n";
+  os << "#undef SWIFT_SYMBOL\n";
+  os << "#endif\n";
+  os << "#define SWIFT_SYMBOL(usrValue) SWIFT_SYMBOL_MODULE_USR(\"";
+  ClangSyntaxPrinter(M.getASTContext(), os).printBaseName(&M);
+  os << "\", usrValue)\n";
+
   // FIXME: Use getRequiredAccess once @expose is supported.
   ModuleWriter writer(moduleOS, prologueOS, info.imports, M, interopContext,
                       AccessLevel::Public, requiresExposedAttribute,
-                      OutputLanguageMode::Cxx);
+                      exposedModules, OutputLanguageMode::Cxx);
   writer.write();
   info.dependsOnStandardLibrary = writer.isStdlibRequired();
   if (M.isStdlibModule()) {
@@ -801,7 +1039,7 @@ EmittedClangHeaderDependencyInfo swift::printModuleContentsAsCxx(
     os << "#endif\n";
     os << "#include <new>\n";
     // Embed an overlay for the standard library.
-    ClangSyntaxPrinter(moduleOS).printIncludeForShimHeader(
+    ClangSyntaxPrinter(M.getASTContext(), moduleOS).printIncludeForShimHeader(
         "_SwiftStdlibCxxOverlay.h");
     // Ignore typos in Swift stdlib doc comments.
     os << "#pragma clang diagnostic push\n";
@@ -822,8 +1060,9 @@ EmittedClangHeaderDependencyInfo swift::printModuleContentsAsCxx(
       os << "#endif\n";
     os << "#ifdef __cplusplus\n";
     os << "namespace ";
-    M.ValueDecl::getName().print(os);
-    os << " __attribute__((swift_private))";
+    ClangSyntaxPrinter(M.getASTContext(), os).printBaseName(&M);
+    os << " SWIFT_PRIVATE_ATTR";
+    ClangSyntaxPrinter(M.getASTContext(), os).printSymbolUSRAttribute(&M);
     os << " {\n";
     os << "namespace " << cxx_synthesis::getCxxImplNamespaceName() << " {\n";
     os << "extern \"C\" {\n";
@@ -838,14 +1077,18 @@ EmittedClangHeaderDependencyInfo swift::printModuleContentsAsCxx(
     os << "}\n";
   }
 
+  os << "#pragma clang diagnostic push\n";
+  os << "#pragma clang diagnostic ignored \"-Wreserved-identifier\"\n";
   // Construct a C++ namespace for the module.
-  ClangSyntaxPrinter(os).printNamespace(
-      [&](raw_ostream &os) { M.ValueDecl::getName().print(os); },
+  ClangSyntaxPrinter(M.getASTContext(), os).printNamespace(
+      [&](raw_ostream &os) { ClangSyntaxPrinter(M.getASTContext(), os).printBaseName(&M); },
       [&](raw_ostream &os) { os << moduleOS.str(); },
-      ClangSyntaxPrinter::NamespaceTrivia::AttributeSwiftPrivate);
+      ClangSyntaxPrinter::NamespaceTrivia::AttributeSwiftPrivate, &M);
+  os << "#pragma clang diagnostic pop\n";
 
   if (M.isStdlibModule()) {
     os << "#pragma clang diagnostic pop\n";
   }
+  os << "#undef SWIFT_SYMBOL\n";
   return info;
 }

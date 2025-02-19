@@ -46,7 +46,8 @@ for filename in os.listdir(sdk_overlay_dir):
         "DifferentiationUnittest",
         "Swift",
         "SwiftLang",
-        "std",  # swiftstd uses `-module-interface-preserve-types-as-written`
+        # swiftCxxStdlib uses `-module-interface-preserve-types-as-written`
+        "CxxStdlib",
     ]:
         continue
 

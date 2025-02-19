@@ -2,7 +2,7 @@
 // RUN: %empty-directory(%t)
 // RUN: %build-silgen-test-overlays
 // RUN: %target-swift-frontend(mock-sdk: -sdk %S/Inputs -I %t) -emit-module -o %t -I %S/../Inputs/ObjCBridging %S/../Inputs/ObjCBridging/Appliances.swift
-// RUN: %target-swift-emit-silgen(mock-sdk: -sdk %S/Inputs -I %t) -module-name objc_bridging -I %S/../Inputs/ObjCBridging -Xllvm -sil-full-demangle %s | %FileCheck %s --check-prefix=CHECK --check-prefix=CHECK-%target-cpu --check-prefix=CHECK-%target-os-%target-cpu
+// RUN: %target-swift-emit-silgen(mock-sdk: -sdk %S/Inputs -I %t) -Xllvm -sil-print-types -module-name objc_bridging -I %S/../Inputs/ObjCBridging -Xllvm -sil-full-demangle %s | %FileCheck %s --check-prefix=CHECK --check-prefix=CHECK-%target-cpu --check-prefix=CHECK-%target-os-%target-cpu
 
 // REQUIRES: objc_interop
 
@@ -464,7 +464,7 @@ class Bas : NSObject {
 func applyStringBlock(_ f: @convention(block) (String) -> String, x: String) -> String {
   // CHECK: bb0([[BLOCK:%.*]] : @guaranteed $@convention(block) @noescape (NSString) -> @autoreleased NSString, [[STRING:%.*]] : @guaranteed $String):
   // CHECK:   [[BLOCK_COPY:%.*]] = copy_block [[BLOCK]]
-  // CHECK:   [[BORROWED_BLOCK_COPY:%.*]] = begin_borrow [lexical] [[BLOCK_COPY]]
+  // CHECK:   [[BORROWED_BLOCK_COPY:%.*]] = begin_borrow [[BLOCK_COPY]]
   // CHECK:   [[BLOCK_COPY_COPY:%.*]] = copy_value [[BORROWED_BLOCK_COPY]]
   // CHECK:   [[STRING_COPY:%.*]] = copy_value [[STRING]]
   // CHECK:   [[STRING_TO_NSSTRING:%.*]] = function_ref @$sSS10FoundationE19_bridgeToObjectiveCSo8NSStringCyF

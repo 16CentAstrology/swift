@@ -1,4 +1,4 @@
-// RUN: %target-swift-frontend(mock-sdk: %clang-importer-sdk) -emit-silgen -I %S/Inputs/custom-modules  -disable-availability-checking %s -verify | %FileCheck --implicit-check-not=hop_to_executor --check-prefix=CHECK --check-prefix=CHECK-%target-cpu %s
+// RUN: %target-swift-frontend(mock-sdk: %clang-importer-sdk) -Xllvm -sil-print-types -emit-silgen -I %S/Inputs/custom-modules  -target %target-swift-5.1-abi-triple %s -verify | %FileCheck --implicit-check-not=hop_to_executor --check-prefix=CHECK --check-prefix=CHECK-%target-cpu %s
 // REQUIRES: concurrency
 // REQUIRES: objc_interop
 
@@ -127,6 +127,13 @@ class SlowServerlet: SlowServer {
         return x
     }
 
+    // CHECK-LABEL: sil{{.*}}13SlowServerlet{{.*}}30doSomethingUnspecifiedNullably{{.*}} :
+    // CHECK:         [[GENERIC_EXECUTOR:%.*]] = enum $Optional<Builtin.Executor>, #Optional.none
+    // CHECK:         hop_to_executor [[GENERIC_EXECUTOR]] :
+    override func doSomethingUnspecifiedNullably() async throws -> String {
+      fatalError()
+    }
+
     // CHECK-LABEL: sil{{.*}}13SlowServerlet{{.*}}17doSomethingFlaggy{{.*}} :
     // CHECK:         [[GENERIC_EXECUTOR:%.*]] = enum $Optional<Builtin.Executor>, #Optional.none
     // CHECK:         hop_to_executor [[GENERIC_EXECUTOR]] :
@@ -195,12 +202,12 @@ class ActorConstrained: NSObject {
 
 actor Dril: NSObject {
     // Dril.postTo(twitter:)
-    // CHECK-LABEL: sil hidden [ossa] @$s{{.*}}4DrilC6postTo7twitter{{.*}} : $@convention(method) @async (@guaranteed String, @guaranteed Dril) -> Bool {
+    // CHECK-LABEL: sil hidden [ossa] @$s{{.*}}4DrilC6postTo7twitter{{.*}} : $@convention(method) @async (@guaranteed String, @sil_isolated @guaranteed Dril) -> Bool {
     // CHECK:           hop_to_executor {{%.*}} : $Dril
 
     // @objc Dril.postTo(twitter:)
-    // CHECK-LABEL: sil private [thunk] [ossa] @$s{{.*}}4DrilC6postTo7twitter{{.*}}To : $@convention(objc_method) (NSString, @convention(block) (Bool) -> (), Dril) -> () {
-    // CHECK:         [[ASYNC_CLOS:%[0-9]+]] = function_ref @$s{{.*}}4DrilC6postTo7twitter{{.*}}U_To : $@convention(thin) @Sendable @async (NSString, @convention(block) (Bool) -> (), Dril) -> ()
+    // CHECK-LABEL: sil private [thunk] [ossa] @$s{{.*}}4DrilC6postTo7twitter{{.*}}To : $@convention(objc_method) (NSString, @convention(block) (Bool) -> (), @sil_isolated Dril) -> () {
+    // CHECK:         [[ASYNC_CLOS:%[0-9]+]] = function_ref @$s{{.*}}4DrilC6postTo7twitter{{.*}}U_To : $@convention(thin) @Sendable @async (NSString, @convention(block) (Bool) -> (), @sil_isolated Dril) -> ()
     // CHECK:         [[PRIMED_CLOS:%[0-9]+]] = partial_apply [callee_guaranteed] [[ASYNC_CLOS]](
     // CHECK:         [[TASK_RUNNER:%[0-9]+]] = function_ref @$ss29_runTaskForBridgedAsyncMethodyyyyYaYbcnF
     // CHECK:         apply [[TASK_RUNNER]]([[PRIMED_CLOS]])

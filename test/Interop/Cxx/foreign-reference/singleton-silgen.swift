@@ -1,6 +1,4 @@
-// RUN: %target-swift-emit-silgen %s -I %S/Inputs -enable-experimental-cxx-interop | %FileCheck %s
-//
-// XFAIL: OS=linux-android, OS=linux-androideabi
+// RUN: %target-swift-emit-silgen -Xllvm -sil-print-types %s -I %S/Inputs -enable-experimental-cxx-interop -disable-availability-checking | %FileCheck %s
 
 import Singleton
 
@@ -36,8 +34,8 @@ public func test() {
   mutateIt(x)
 }
 
-// CHECK-LABEL: sil [clang DeletedSpecialMembers.create] @{{_ZN21DeletedSpecialMembers6createEv|\?create\@DeletedSpecialMembers\@\@SAPEAU1\@XZ}} : $@convention(c) () -> DeletedSpecialMembers
+// CHECK-LABEL: sil{{ \[available .*\] | }}[clang DeletedSpecialMembers.create] @{{_ZN21DeletedSpecialMembers6createEv|\?create\@DeletedSpecialMembers\@\@SAPEAU1\@XZ}} : $@convention(c) () -> DeletedSpecialMembers
 
-// CHECK-LABEL: sil [clang DeletedSpecialMembers.test] @{{_ZNK21DeletedSpecialMembers4testEv|\?test\@DeletedSpecialMembers\@\@QEBAHXZ}} : $@convention(cxx_method) (@in_guaranteed DeletedSpecialMembers) -> Int32
+// CHECK-LABEL: sil{{ \[available .*\] | }}[clang DeletedSpecialMembers.test] @{{_ZNK21DeletedSpecialMembers4testEv|\?test\@DeletedSpecialMembers\@\@QEBAHXZ}} : $@convention(cxx_method) (@in_guaranteed DeletedSpecialMembers) -> Int32
 
-// CHECK-LABEL: sil [serialized] [clang mutateIt] @{{_Z8mutateItR21DeletedSpecialMembers|\?mutateIt\@\@YAXAEAUDeletedSpecialMembers\@\@\@Z}} : $@convention(c) (DeletedSpecialMembers) -> ()
+// CHECK-LABEL: sil{{ \[available .*\] | }}[serialized] [clang mutateIt] @{{_Z8mutateItR21DeletedSpecialMembers|\?mutateIt\@\@YAXAEAUDeletedSpecialMembers\@\@\@Z}} : $@convention(c) (DeletedSpecialMembers) -> ()
